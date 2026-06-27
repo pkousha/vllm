@@ -52,6 +52,7 @@ All2AllBackend = Literal[
     "mori_low_latency",
     "moonep",
     "mori",
+    "nccl_ep",
     "nixl_ep",
     "allgather_reducescatter",
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
