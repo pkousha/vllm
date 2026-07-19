@@ -60,6 +60,7 @@ All2AllBackend = Literal[
     "flashinfer_nvlink_one_sided",
     "passthrough",
 ]
+NcclEPActivationFormat = Literal["standard", "batched"]
 
 
 @config
@@ -250,6 +251,13 @@ class ParallelConfig:
     """Whether the "mori" all2all backend runs MoRI EPv2. Resolved from
     `VLLM_MORI_EP_V2` and the deployment by `resolve_mori_all2all`; not meant
     to be set by users."""
+
+    nccl_ep_activation_format: NcclEPActivationFormat = "standard"
+    """Activation format used by the NCCL EP backend.
+
+    - "standard": Use the standard contiguous expert format
+    - "batched": Use the batched experts format
+    """
 
     max_parallel_loading_workers: int | None = Field(default=None, ge=1)
     """Maximum number of parallel loading workers when loading model
