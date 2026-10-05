@@ -124,6 +124,21 @@ Placements = tuple[int, int]
 REPLICATED: Placements | None = None
 
 
+@dataclass(frozen=True)
+class M2NLayout:
+    """A tensor's mesh and placement on one side of a transfer."""
+
+    mesh: M2NMesh
+    placements: Placements | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mesh, M2NMesh):
+            raise TypeError("M2N layout mesh must be an M2NMesh")
+        if self.placements is not None:
+            object.__setattr__(self, "placements", tuple(self.placements))
+            check_placements(self.placements)
+
+
 def check_placements(placements: Placements, context: str = "placements") -> None:
     """Reject placement pairs m2n cannot express.
 
@@ -252,6 +267,10 @@ class M2NParamMeta(ParamMeta):
     """
 
     placements: Placements | None
+
+    # Optional until the trainer and worker handshake adopts per-parameter layouts.
+    source_layout: M2NLayout | None = None
+    allow_full_fallback: bool = True
 
 
 def check_transferable(name: str, dtype: torch.dtype, shape: Sequence[int]) -> None:
