@@ -33,8 +33,11 @@ def unpack_tensor(
 ) -> list[tuple[str, torch.Tensor]]:
     """Unpack a packed uint8 tensor into a list of named tensors.
 
-    The returned tensors are **views** of ``packed_tensor`` (the
-    ``.contiguous()`` call is a no-op on already-contiguous row-slices).
+    The returned tensors are views of ``packed_tensor`` when their byte offsets
+    meet the target dtype's alignment requirement. Because the packed format
+    has no inter-tensor padding, only misaligned mixed-dtype slices are cloned
+    before reinterpretation.
+
     If ``packed_tensor`` lives in storage that may be reused — e.g. a
     reused CUDA IPC buffer — callers must clone the results before the
     underlying storage is overwritten.
@@ -48,11 +51,15 @@ def unpack_tensor(
 
     """
     unpacked_tensors = packed_tensor.split(tensor_sizes)
+    results: list[tuple[str, torch.Tensor]] = []
+    for name, shape, dtype, tensor in zip(names, shapes, dtypes, unpacked_tensors):
+        # A uint8 slice is contiguous even when its byte offset is invalid for
+        # Tensor.view(dtype). Give only that slice aligned storage.
+        if tensor.storage_offset() % dtype.itemsize:
+            tensor = tensor.clone()
+        results.append((name, tensor.view(dtype).view(*shape)))
 
-    return [
-        (name, tensor.contiguous().view(dtype).view(*shape))
-        for name, shape, dtype, tensor in zip(names, shapes, dtypes, unpacked_tensors)
-    ]
+    return results
 
 
 @dataclass

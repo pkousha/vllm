@@ -67,6 +67,33 @@ def create_state_dict_info(
     return {name: (tuple(tensor.shape), tensor.dtype) for name, tensor in params}
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_unpack_tensor_aligns_only_misaligned_mixed_dtype_slices():
+    fp16 = torch.tensor([1.25, -2.5, 3.75], dtype=torch.float16, device="cuda")
+    int64 = torch.tensor([2**40 + 7, -(2**39)], dtype=torch.int64, device="cuda")
+    int16 = torch.tensor([-123], dtype=torch.int16, device="cuda")
+    tensors = [fp16, int64, int16]
+    packed = torch.cat([tensor.view(torch.uint8).view(-1) for tensor in tensors])
+
+    result = dict(
+        unpack_tensor(
+            packed,
+            names=["fp16", "misaligned_int64", "aligned_int16"],
+            shapes=[list(tensor.shape) for tensor in tensors],
+            dtypes=[tensor.dtype for tensor in tensors],
+            tensor_sizes=[tensor.nbytes for tensor in tensors],
+        )
+    )
+
+    torch.testing.assert_close(result["fp16"], fp16)
+    torch.testing.assert_close(result["misaligned_int64"], int64)
+    torch.testing.assert_close(result["aligned_int16"], int16)
+    packed_storage = packed.untyped_storage().data_ptr()
+    assert result["fp16"].untyped_storage().data_ptr() == packed_storage
+    assert result["misaligned_int64"].untyped_storage().data_ptr() != packed_storage
+    assert result["aligned_int16"].untyped_storage().data_ptr() == packed_storage
+
+
 # --- Unit Tests: packed_nccl_broadcast_producer ---
 
 
