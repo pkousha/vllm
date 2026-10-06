@@ -124,6 +124,14 @@ class M2NWeightTransferInitInfo(WeightTransferInitInfo):
     """SHA-256 of the ordered, versioned source parameter plan."""
     params: list[dict[str, Any]]
     """Ordered per-parameter source metadata and layouts."""
+    worker_rank_offset: int | None = None
+    """Deployment-local worker-rank offset.
+
+    ``rank_offset`` remains the common start rank of the complete destination
+    mesh. Multi-deployment inference sets this field to the start rank of one
+    deployment so vLLM's deployment-local DP ranks remain globally unique. A
+    single deployment may leave it unset.
+    """
     nccl_unique_id_b64: str | None = field(default=None, repr=False)
     """Optional UID for the NCCL data plane; TCP remains the metadata plane."""
     max_cta: int | None = None
@@ -141,6 +149,14 @@ class M2NWeightTransferInitInfo(WeightTransferInitInfo):
             raise ValueError(
                 f"`rank_offset` ({self.rank_offset}) must leave at least one "
                 f"trainer rank and one worker in world_size {self.world_size}"
+            )
+        if self.worker_rank_offset is not None and not (
+            self.rank_offset <= self.worker_rank_offset < self.world_size
+        ):
+            raise ValueError(
+                "`worker_rank_offset` must lie inside the common destination "
+                f"rank interval [{self.rank_offset}, {self.world_size}); got "
+                f"{self.worker_rank_offset}"
             )
 
     @property
@@ -262,7 +278,11 @@ class M2NWeightTransferEngine(
         rendezvous_info = NCCLWeightTransferInitInfo(
             master_address=init_info.master_address,
             master_port=init_info.master_port,
-            rank_offset=init_info.rank_offset,
+            rank_offset=(
+                init_info.rank_offset
+                if init_info.worker_rank_offset is None
+                else init_info.worker_rank_offset
+            ),
             world_size=init_info.world_size,
         )
         metadata_group = worker_init_metadata_group(

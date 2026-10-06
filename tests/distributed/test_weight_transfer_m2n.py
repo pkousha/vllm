@@ -535,6 +535,7 @@ class TestWireTypes:
         engine.init_transfer_engine(info)
 
         init_metadata.assert_called_once()
+        assert init_metadata.call_args.args[0].rank_offset == info.rank_offset
         uid_init.assert_called_once_with(
             b"\x00" * 128,
             rank=1,
@@ -861,6 +862,7 @@ class TestWireTypes:
         )
         info = self._init_info(
             schema_version=M2N_WIRE_SCHEMA_VERSION + (error == "schema"),
+            worker_rank_offset=2,
         )
         peer = {
             "phase": "source",
@@ -875,7 +877,8 @@ class TestWireTypes:
 
         envelope = group.all_gather_obj.call_args.args[0]
         assert error in envelope["error"]
-        assert init_metadata_group.call_args.args[0].rank_offset == info.rank_offset
+        assert init_metadata_group.call_args.args[0].rank_offset == 2
+        assert info.rank_offset == 1
         make_pynccl.assert_not_called()
 
     def test_local_runtime_failure_is_agreed_before_pynccl(self, monkeypatch):
@@ -1025,6 +1028,13 @@ class TestWireTypes:
     def test_world_must_hold_a_trainer_and_a_worker(self):
         with pytest.raises(ValueError, match="rank_offset"):
             self._init_info(rank_offset=3, world_size=3)
+
+    @pytest.mark.parametrize("worker_rank_offset", [0, 3])
+    def test_worker_rank_offset_must_stay_in_destination_interval(
+        self, worker_rank_offset
+    ):
+        with pytest.raises(ValueError, match="worker_rank_offset"):
+            self._init_info(worker_rank_offset=worker_rank_offset)
 
     @pytest.mark.parametrize("dtype_name", ["not_a_dtype", "Tensor"])
     def test_invalid_dtype_name_names_parameter(self, dtype_name):
@@ -2134,6 +2144,7 @@ def _m2n_worker_receive(
     master_port: int,
     world_size: int,
     worker_rank: int = 0,
+    worker_rank_offset: int | None = None,
 ) -> dict:
     """Receive that parameter through the real worker engine."""
     from unittest.mock import MagicMock
@@ -2201,6 +2212,7 @@ def _m2n_worker_receive(
             dst_mesh_dims=[1, world_size - 1],
             source_digest=source_plan_digest([param]),
             params=[param.to_dict()],
+            worker_rank_offset=worker_rank_offset,
         )
     )
     engine.start_weight_update()
@@ -2235,7 +2247,8 @@ def _m2n_worker_receive(
     torch.accelerator.device_count() < 2,
     reason="Need at least 2 GPUs: one trainer rank and one inference worker.",
 )
-def test_m2n_weight_transfer_between_processes():
+@pytest.mark.parametrize("worker_rank_offset", [None, 1], ids=["default", "explicit"])
+def test_m2n_weight_transfer_between_processes(worker_rank_offset):
     """A parameter survives a real reshard from a trainer process to a worker.
 
     This test builds both engines, joins one NCCL communicator across two
@@ -2249,7 +2262,9 @@ def test_m2n_weight_transfer_between_processes():
     master_port = get_open_port()
     world_size = 2  # 1 trainer + 1 inference worker
 
-    worker = _m2n_worker_receive.remote(master_address, master_port, world_size)
+    worker = _m2n_worker_receive.remote(
+        master_address, master_port, world_size, 0, worker_rank_offset
+    )
     trainer = _m2n_trainer_send.remote(master_address, master_port, world_size)
     trainer_ok, result = ray.get([trainer, worker], timeout=300)
 
