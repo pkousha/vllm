@@ -355,18 +355,20 @@ def resolve_parameter_destinations(
 
     close_staging_group()
 
-    # Layerwise reload restores model-format tensors as a unit. A checkpoint
-    # alias need not name the parameter or module that its loader ultimately
-    # updates, so there is no generic way to prove a cached direct pointer is
-    # outside that lifecycle. Keep raw writes only for an entirely in-place
-    # update.
-    uses_model_loader = any(not destination.direct for destination in destinations)
+    # Layerwise reload restores model-format tensors as a unit. Mixing direct
+    # and model-loader parameters within one module can copy stale storage
+    # over a direct load.
+    reload_modules = {
+        name.rpartition(".")[0]
+        for name, destination in zip(names, destinations)
+        if not destination.direct and name in params
+    }
     for index, destination in enumerate(destinations):
-        if uses_model_loader and destination.direct:
+        if destination.direct and destination.name.rpartition(".")[0] in reload_modules:
             if not fallback_allowed[index]:
                 raise ValueError(
-                    f"parameter '{destination.name}' cannot be mixed with "
-                    "model-loader destinations without a full fallback"
+                    f"parameter '{destination.name}' cannot share a module "
+                    "with a model-loader destination without a full fallback"
                 )
             destinations[index] = M2NDestination(
                 name=destination.name,

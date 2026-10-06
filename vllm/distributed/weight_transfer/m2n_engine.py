@@ -473,12 +473,6 @@ class M2NWeightTransferEngine(
             destination.mode is not M2NDestinationMode.IN_PLACE
             for destination in self._parameter_destinations
         )
-        if self._uses_load_weights and any(
-            destination.direct for destination in self._parameter_destinations
-        ):
-            raise AssertionError(
-                "destination planner mixed in-place and model-loader entries"
-            )
         requirements = [
             M2NStagingRequirement(
                 group=cast(int, destination.staging_group),

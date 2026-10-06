@@ -2324,6 +2324,12 @@ class _MixedModel(torch.nn.Module):
             RowParallelLinear.weight_loader, Mock(tp_size=2)
         )
         self.proj.bias = torch.nn.Parameter(torch.zeros(16))
+        self.other = torch.nn.Module()
+        self.other.weight = torch.nn.Parameter(torch.zeros(16, 8))
+        self.other.weight.input_dim = 1
+        self.other.weight.weight_loader = MethodType(
+            RowParallelLinear.weight_loader, Mock(tp_size=2)
+        )
 
 
 def _resolve(names, dtypes, shapes, **kwargs):
@@ -2552,17 +2558,28 @@ class TestDestinationResolution:
         )
         assert destination.mode is M2NDestinationMode.FULL_FALLBACK
 
-    def test_fallback_parameter_demotes_direct_sibling_in_same_module(self):
-        destinations = resolve_parameter_destinations(
-            _MixedModel(),
-            ["proj.weight", "proj.bias"],
-            [torch.float32, torch.float32],
-            [(16, 16), (16,)],
-            num_workers=2,
-            shard_axis_size=2,
-            allow_direct=True,
-        )
-        assert not any(destination.direct for destination in destinations)
+    def test_fallback_parameter_demotes_only_direct_siblings_in_same_module(self):
+        engine = object.__new__(M2NWeightTransferEngine)
+        engine._dst_mesh = M2NMesh((1, 2), 1)
+        layout = M2NLayout(M2NMesh((1, 1), 0), REPLICATED)
+        names = ["proj.weight", "proj.bias", "other.weight"]
+        shapes = [(16, 16), (16,), (16, 16)]
+        engine._metas = [
+            M2NParamMeta(name, torch.float32, shape, layout)
+            for name, shape in zip(names, shapes)
+        ]
+        engine.model = _MixedModel()
+        engine.model_config = SimpleNamespace(quantization=None)
+        engine.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+        engine.device = torch.device("cuda:0")
+
+        engine._prepare_destination_plan(metadata_rank=1, num_workers=2)
+
+        assert [destination.mode for destination in engine._parameter_destinations] == [
+            M2NDestinationMode.FULL_FALLBACK,
+            M2NDestinationMode.FULL_FALLBACK,
+            M2NDestinationMode.IN_PLACE,
+        ]
 
     def test_unknown_loader_falls_back_despite_matching_name_and_shape(self):
         model = _Model()
@@ -2674,7 +2691,7 @@ class TestDestinationResolution:
             )
 
         assert (
-            "0/2 parameters resharded directly into the model, 0 via sharded "
-            "staging, 2 via full-tensor fallback; direct byte coverage: "
-            "0/2097216 bytes (0.0%)" in caplog_vllm.text
+            "1/2 parameters resharded directly into the model, 0 via sharded "
+            "staging, 1 via full-tensor fallback; direct byte coverage: "
+            "64/2097216 bytes (0.0%)" in caplog_vllm.text
         )
