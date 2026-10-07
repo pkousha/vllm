@@ -361,10 +361,8 @@ class RoutedExperts(PluggableLayer):
     ) -> tuple[int, ...]:
         assert self.moe_config.hidden_dim_unpadded is not None
         assert self.moe_config.intermediate_size_per_partition_unpadded is not None
-        hidden_size = int(self.moe_config.hidden_dim_unpadded)
-        intermediate_size = int(
-            self.moe_config.intermediate_size_per_partition_unpadded
-        )
+        hidden_size = self.moe_config.hidden_dim_unpadded
+        intermediate_size = self.moe_config.intermediate_size_per_partition_unpadded
         if kind == "w13":
             return (
                 num_experts,
@@ -374,10 +372,7 @@ class RoutedExperts(PluggableLayer):
         return (num_experts, hidden_size, intermediate_size)
 
     def _local_global_expert_ids(self) -> tuple[int, ...]:
-        return tuple(
-            int(expert_id)
-            for expert_id in self.expert_map_manager.get_local_expert_ids()
-        )
+        return tuple(self.expert_map_manager.get_local_expert_ids())
 
     def resolve_sharded_weight_target(
         self,
@@ -392,8 +387,6 @@ class RoutedExperts(PluggableLayer):
         if relative_name in {
             "w13_weight",
             "w2_weight",
-            "routed_experts.w13_weight",
-            "routed_experts.w2_weight",
         }:
             raise ValueError(
                 f"{request.name!r} names kernel-formatted expert storage; "
@@ -1129,7 +1122,7 @@ class RoutedExperts(PluggableLayer):
                 assert (
                     self.moe_config.intermediate_size_per_partition_unpadded is not None
                 )
-                intermediate_size = int(
+                intermediate_size = (
                     self.moe_config.intermediate_size_per_partition_unpadded
                 )
                 logical_shards: tuple[tuple[str, torch.Tensor], ...] = (

@@ -2607,6 +2607,8 @@ class TestDestinationResolution:
             num_workers=2,
             shard_axis_size=2,
             allow_direct=True,
+            destination_shard_index=0,
+            allow_full_fallback=[True],
         )
         assert not destination.direct
 
@@ -2621,6 +2623,8 @@ class TestDestinationResolution:
             num_workers=2,
             shard_axis_size=2,
             allow_direct=True,
+            destination_shard_index=0,
+            allow_full_fallback=[True],
         )
         assert not destination.direct
 
@@ -2640,6 +2644,8 @@ class TestDestinationResolution:
             num_workers=2,
             shard_axis_size=2,
             allow_direct=True,
+            destination_shard_index=0,
+            allow_full_fallback=[True],
         )
         assert not destination.direct
 
@@ -2654,6 +2660,8 @@ class TestDestinationResolution:
             num_workers=2,
             shard_axis_size=2,
             allow_direct=True,
+            destination_shard_index=0,
+            allow_full_fallback=[True],
         )
         assert not destination.direct
 
@@ -2668,6 +2676,8 @@ class TestDestinationResolution:
             num_workers=2,
             shard_axis_size=2,
             allow_direct=True,
+            destination_shard_index=0,
+            allow_full_fallback=[True],
         )
         assert not destination.direct
 
@@ -2682,6 +2692,8 @@ class TestDestinationResolution:
             num_workers=2,
             shard_axis_size=2,
             allow_direct=True,
+            destination_shard_index=0,
+            allow_full_fallback=[True],
         )
         assert not destination.direct
 

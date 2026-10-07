@@ -479,8 +479,6 @@ def test_expert_resolver_declines_unknown_or_unstacked_names():
     [
         "w13_weight",
         "w2_weight",
-        "routed_experts.w13_weight",
-        "routed_experts.w2_weight",
     ],
 )
 def test_kernel_formatted_expert_storage_fails_closed(name: str):

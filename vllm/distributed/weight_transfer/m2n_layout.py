@@ -203,17 +203,13 @@ def resolve_parameter_destinations(
     num_workers: int,
     shard_axis_size: int,
     allow_direct: bool,
-    destination_shard_index: int = 0,
-    allow_full_fallback: Sequence[bool] | None = None,
+    destination_shard_index: int,
+    allow_full_fallback: Sequence[bool],
 ) -> list[M2NDestination]:
     """Resolve semantic targets, then conservative exact-name destinations."""
     if not (len(names) == len(dtypes) == len(shapes)):
         raise ValueError("destination inputs must have the same length")
-    fallback_allowed = (
-        (True,) * len(names)
-        if allow_full_fallback is None
-        else tuple(allow_full_fallback)
-    )
+    fallback_allowed = tuple(allow_full_fallback)
     if len(fallback_allowed) != len(names) or any(
         not isinstance(value, bool) for value in fallback_allowed
     ):
