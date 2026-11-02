@@ -7,6 +7,7 @@ import nccl.ep as nccl_ep  # type: ignore[import-not-found]
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed.device_communicators.all2all import nccl_ep_max_recv_tokens
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -44,8 +45,7 @@ def _get_cuda_stream():
 
 
 class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
-    """
-    Prepare/Finalize using NCCL EP with EXPERT_MAJOR layout
+    """Prepare/Finalize using NCCL EP with EXPERT_MAJOR layout
     (BatchedExperts activation format).
     """
 
@@ -65,7 +65,8 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         self.ep_group = ep_group
         self.max_tokens_per_rank = max_tokens_per_rank
-        self.use_fp8_dispatch = use_fp8_dispatch
+        if use_fp8_dispatch:
+            raise ValueError("NCCL EP FP8 transport is not supported yet; use BF16.")
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.num_dispatchers_ = num_dispatchers
@@ -104,7 +105,11 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def _map_global_to_physical_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
         if self.global_to_physical is None:
             return topk_ids
-        return self.global_to_physical[topk_ids]
+        valid = (topk_ids >= 0) & (topk_ids < self.global_to_physical.numel())
+        physical_ids = self.global_to_physical[
+            topk_ids.clamp(0, self.global_to_physical.numel() - 1)
+        ]
+        return torch.where(valid, physical_ids, -1)
 
     def _do_quant(
         self,
@@ -117,9 +122,7 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         if q_dtype == "nvfp4":
             q_dtype = None
-            logger.debug_once(
-                "Using NCCL EP bfloat16 dispatch for NVFP4 MoE."
-            )
+            logger.debug_once("Using NCCL EP bfloat16 dispatch for NVFP4 MoE.")
 
         x = x.view((-1, hidden_dim))
         x, x_scales = moe_kernel_quantize_input(
@@ -151,10 +154,13 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> tuple[Callable, mk.ReceiverType]:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("NCCL EP CUDA graph capture is not supported yet.")
+        if a1.dtype != torch.bfloat16:
+            raise ValueError("NCCL EP currently requires BF16 transport inputs.")
         if defer_input_quant:
             raise NotImplementedError(
-                f"{self.__class__.__name__} does not support "
-                "defer_input_quant=True."
+                f"{self.__class__.__name__} does not support defer_input_quant=True."
             )
 
         a2a_idx = dbo_current_ubatch_id()
@@ -166,6 +172,7 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             a1 = a1 * topk_weights.to(a1.dtype)
 
+        assert a1.shape[0] <= self.max_tokens_per_rank
         hidden = a1.shape[1]
         stream = _get_cuda_stream()
 
@@ -178,8 +185,10 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             stream=stream,
         )
 
-        max_recv = self.max_tokens_per_rank * self.num_dispatchers_
-        recv_tokens = torch.empty(
+        max_recv = nccl_ep_max_recv_tokens(
+            self.max_tokens_per_rank, self.num_dispatchers_
+        )
+        recv_tokens = torch.zeros(
             (self.num_local_experts, max_recv, hidden),
             dtype=a1.dtype,
             device=a1.device,
@@ -231,9 +240,7 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_dtype: torch.dtype,
         quant_config: FusedMoEQuantConfig,
     ) -> mk.PrepareResultType:
-        expert_x, expert_x_scale = self._do_quant(
-            expert_x, a1_dtype, quant_config
-        )
+        expert_x, expert_x_scale = self._do_quant(expert_x, a1_dtype, quant_config)
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens,
@@ -279,6 +286,8 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             "Weight application and reduction happens in the combine kernel."
         )
 
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("NCCL EP CUDA graph capture is not supported yet.")
         a2a_idx = dbo_current_ubatch_id()
         ep_handle = self.handles[a2a_idx]
         assert ep_handle is not None

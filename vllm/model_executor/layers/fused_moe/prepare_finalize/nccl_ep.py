@@ -7,6 +7,7 @@ import nccl.ep as nccl_ep  # type: ignore[import-not-found]
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed.device_communicators.all2all import nccl_ep_max_recv_tokens
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -14,9 +15,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    per_token_group_quant_fp8,
-)
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
@@ -50,8 +48,7 @@ def _get_cuda_stream():
 
 
 class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
-    """
-    Prepare/Finalize using NCCL EP with FLAT layout
+    """Prepare/Finalize using NCCL EP with FLAT layout
     (Standard activation format).
     """
 
@@ -74,7 +71,8 @@ class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.rank_expert_offset = rank_expert_offset
         self.num_experts = num_experts
         self.num_topk = num_topk
-        self.use_fp8_dispatch = use_fp8_dispatch
+        if use_fp8_dispatch:
+            raise ValueError("NCCL EP FP8 transport is not supported yet; use BF16.")
 
         self.handles: list = [None, None]
 
@@ -97,14 +95,14 @@ class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def _do_dispatch(
         self,
         tokens: torch.Tensor,
-        token_scales: torch.Tensor | None,
         rank_topk_ids: torch.Tensor,
         rank_topk_weights: torch.Tensor,
-        num_experts: int,
         a1_scale: torch.Tensor | None,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
     ) -> Callable:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("NCCL EP CUDA graph capture is not supported yet.")
         num_tokens = tokens.shape[0]
         assert num_tokens <= self.max_tokens_per_rank
         hidden = tokens.shape[1]
@@ -113,16 +111,29 @@ class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         dbo_yield_and_switch_from_compute_to_comm()
 
+        recv_total = torch.empty(1, dtype=torch.int32, device=tokens.device)
+        expert_counts = torch.empty(
+            self.num_experts // self.num_dispatchers_,
+            dtype=torch.int32,
+            device=tokens.device,
+        )
+        layout_info = nccl_ep.LayoutInfo(
+            expert_counters=_to_nccl_tensor(expert_counts),
+            recv_total_counter=_to_nccl_tensor(recv_total),
+            recv_topk_idx_kind=nccl_ep.ExpertIdKind.LOCAL,
+        )
         ep_handle = self.ep_group.create_handle(
             nccl_ep.Layout.FLAT,
             _to_nccl_tensor(rank_topk_ids),
+            layout_info=layout_info,
             config=nccl_ep.HandleConfig(),
             stream=stream,
         )
 
-        # During CUDA graph capture NCCL copies the group's full configured
-        # receive bound, regardless of the current invocation's token count.
-        max_recv = self.max_tokens_per_rank * self.dp_size
+        # FLAT sends each token at most once to each EP rank, irrespective of DP.
+        max_recv = nccl_ep_max_recv_tokens(
+            self.max_tokens_per_rank, self.num_dispatchers_
+        )
         recv_tokens = torch.empty(
             (max_recv, hidden),
             dtype=tokens.dtype,
@@ -138,32 +149,13 @@ class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             dtype=torch.int64,
             device=tokens.device,
         )
-        recv_token_scales = None
-        if token_scales is not None:
-            assert token_scales.ndim == 2
-            assert token_scales.shape[0] == num_tokens
-            assert token_scales.dtype == torch.float32
-            recv_token_scales = torch.empty(
-                (max_recv, token_scales.shape[1]),
-                dtype=token_scales.dtype,
-                device=token_scales.device,
-            )
-
         dispatch_inputs = nccl_ep.DispatchInputs(
             tokens=_to_nccl_tensor(tokens),
             topk_weights=_to_nccl_tensor(rank_topk_weights),
-            scales=(
-                _to_nccl_tensor(token_scales) if token_scales is not None else None
-            ),
         )
         dispatch_outputs = nccl_ep.DispatchOutputs(
             tokens=_to_nccl_tensor(recv_tokens),
             topk_weights=_to_nccl_tensor(recv_topk_weights),
-            scales=(
-                _to_nccl_tensor(recv_token_scales)
-                if recv_token_scales is not None
-                else None
-            ),
             topk_idx=_to_nccl_tensor(recv_topk_idx),
         )
 
@@ -182,10 +174,10 @@ class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         return lambda: self._receiver(
             recv_tokens,
-            recv_token_scales,
             recv_topk_idx,
             recv_topk_weights,
-            num_experts,
+            recv_total,
+            expert_counts,
             a1_scale,
             quant_config,
             defer_input_quant=defer_input_quant,
@@ -194,61 +186,49 @@ class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def _receiver(
         self,
         recv_x: torch.Tensor,
-        recv_x_scale: torch.Tensor | None,
         recv_topk_idx: torch.Tensor | None,
         recv_topk_weights: torch.Tensor | None,
-        num_experts: int,
+        recv_total: torch.Tensor,
+        expert_counts: torch.Tensor,
         a1_scale: torch.Tensor | None,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
     ) -> mk.PrepareResultType:
-        expert_x = recv_x
-        expert_x_scale = recv_x_scale
-
-        # NCCL EP HT dispatch transports one FP8 scale per token. DeepGEMM's
-        # block-FP8 interface expects one activation scale per 128-wide block,
-        # so repeat the transport scale across the hidden-dimension blocks.
-        if expert_x_scale is not None and quant_config.is_block_quantized:
-            assert quant_config.block_shape is not None
-            block_size = quant_config.block_shape[1]
-            num_scale_groups = (expert_x.shape[1] + block_size - 1) // block_size
-            assert expert_x_scale.shape == (expert_x.shape[0], 1)
-            expert_x_scale = expert_x_scale.expand(-1, num_scale_groups).contiguous()
+        num_recv = int(recv_total.item())
+        if not 0 <= num_recv <= recv_x.shape[0]:
+            raise RuntimeError(
+                f"NCCL EP received {num_recv} rows for capacity {recv_x.shape[0]}"
+            )
+        expert_x = recv_x[:num_recv]
+        expert_x_scale = None
+        if recv_topk_idx is not None:
+            recv_topk_idx = recv_topk_idx[:num_recv]
+        if recv_topk_weights is not None:
+            recv_topk_weights = recv_topk_weights[:num_recv]
 
         if recv_topk_idx is not None:
-            recv_topk_idx = recv_topk_idx + self.rank_expert_offset
-            invalid = recv_topk_idx < 0
-            if invalid.any():
-                fill_val = (
-                    num_experts - 1
-                    if self.rank_expert_offset == 0
-                    else 0
-                )
-                recv_topk_idx = torch.where(invalid, fill_val, recv_topk_idx)
+            valid = (recv_topk_idx >= 0) & (recv_topk_idx < expert_counts.numel())
+            # Match DeepEP HT: expert_map filters a valid nonlocal global ID.
+            invalid_id = -1
+            if self.num_dispatchers_ > 1:
+                invalid_id = self.num_experts - 1 if self.rank_expert_offset == 0 else 0
+            recv_topk_idx = torch.where(
+                valid, recv_topk_idx + self.rank_expert_offset, invalid_id
+            )
+            if recv_topk_weights is not None:
+                recv_topk_weights = torch.where(valid, recv_topk_weights, 0.0)
 
-        # Build per-expert token counts from topk_idx
-        expert_num_tokens_list = []
-        if recv_topk_idx is not None:
-            local_ids = recv_topk_idx[:, 0] - self.rank_expert_offset
-            num_local = self.num_experts // self.num_dispatchers_
-            for e in range(num_local):
-                expert_num_tokens_list.append(
-                    int((local_ids == e).sum().item())
-                )
-        expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
-            expert_num_tokens_list, device=expert_x.device
+        expert_tokens_meta = mk.ExpertTokensMetadata(
+            expert_num_tokens=expert_counts,
+            expert_num_tokens_cpu=expert_counts.cpu(),
         )
 
-        if (
-            expert_x_scale is None
-            and not defer_input_quant
-            and expert_x.numel() != 0
-        ):
+        if not defer_input_quant and expert_x.numel() != 0:
             expert_x, expert_x_scale = moe_kernel_quantize_input(
                 expert_x,
                 a1_scale,
                 quant_dtype=quant_config.quant_dtype,
-                per_act_token_quant=False,
+                per_act_token_quant=quant_config.per_act_token_quant,
                 block_shape=quant_config.block_shape,
             )
 
@@ -281,38 +261,18 @@ class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             a1 = a1 * topk_weights.to(a1.dtype)
 
-        if (
-            self.use_fp8_dispatch
-            and quant_config.is_block_quantized
-            and not defer_input_quant
-        ):
-            # NCCL EP HT dispatch accepts FP8 payloads with one float scale per
-            # token. Quantize the entire hidden row as one group for transport;
-            # _receiver expands the scale to DeepGEMM's block-FP8 layout.
-            a1q, a1q_scale = per_token_group_quant_fp8(
-                a1,
-                group_size=a1.shape[-1],
-                dtype=torch.float8_e4m3fn,
-            )
-            assert a1q.dtype == torch.float8_e4m3fn
-            a1q_scale = a1q_scale.view(a1q.shape[0], -1)
-            assert a1q_scale.shape == (a1q.shape[0], 1)
-            a1_post_scale = None
-        else:
-            a1q = a1
-            a1q_scale = None
-            a1_post_scale = (
-                quant_config.a1_gscale
-                if quant_config.quant_dtype == "nvfp4"
-                else quant_config.a1_scale
-            )
+        if a1.dtype != torch.bfloat16:
+            raise ValueError("NCCL EP currently requires BF16 transport inputs.")
+        a1_post_scale = (
+            quant_config.a1_gscale
+            if quant_config.quant_dtype == "nvfp4"
+            else quant_config.a1_scale
+        )
 
         return self._do_dispatch(
-            tokens=a1q,
-            token_scales=a1q_scale,
+            tokens=a1,
             rank_topk_ids=topk_ids,
             rank_topk_weights=topk_weights,
-            num_experts=num_experts,
             a1_scale=a1_post_scale,
             quant_config=quant_config,
             defer_input_quant=defer_input_quant,
@@ -351,6 +311,8 @@ class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
         do_async: bool,
     ) -> Callable | None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("NCCL EP CUDA graph capture is not supported yet.")
         a2a_idx = dbo_current_ubatch_id()
         ep_handle = self.handles[a2a_idx]
         assert ep_handle is not None
@@ -366,13 +328,15 @@ class NcclEPStandardPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
 
+        else:
+            fused_expert_output = fused_expert_output.reshape(0, output.shape[-1])
+
         stream = _get_cuda_stream()
 
         dbo_yield_and_switch_from_compute_to_comm()
 
         assert fused_expert_output.dtype == torch.bfloat16, (
-            f"NCCL EP combine requires bfloat16, "
-            f"got {fused_expert_output.dtype}"
+            f"NCCL EP combine requires bfloat16, got {fused_expert_output.dtype}"
         )
 
         combined_output = torch.empty_like(output)
