@@ -1415,6 +1415,8 @@ class NcclEPAll2AllManager(All2AllManagerBase):
         )
 
         self._ep_groups: dict[tuple[int, int, int, int], Any] = {}
+        self._prepare_finalizers: list[Any] = []
+        self._destroyed = False
         self._lock = threading.RLock()
 
     def _get_or_create_group(
@@ -1434,6 +1436,8 @@ class NcclEPAll2AllManager(All2AllManagerBase):
         )
 
         with self._lock:
+            if self._destroyed:
+                raise RuntimeError("NCCL EP manager has been destroyed.")
             if key not in self._ep_groups:
                 max_recv_tokens_per_rank = nccl_ep_max_recv_tokens(
                     max_dispatch_tokens_per_rank, self.world_size
@@ -1514,9 +1518,21 @@ class NcclEPAll2AllManager(All2AllManagerBase):
     def max_sms_used(self) -> int | None:
         return None
 
+    def register_prepare_finalize(self, prepare_finalize):
+        with self._lock:
+            if self._destroyed:
+                raise RuntimeError("NCCL EP manager has been destroyed.")
+            self._prepare_finalizers.append(prepare_finalize)
+
     def destroy(self):
         with self._lock:
+            if self._destroyed:
+                return
+            for prepare_finalize in self._prepare_finalizers:
+                prepare_finalize.destroy()
+            self._prepare_finalizers.clear()
             for _, group in self._ep_groups.items():
                 group.destroy()
             self._ep_groups.clear()
-        self.nccl_comm.destroy()
+            self.nccl_comm.destroy()
+            self._destroyed = True

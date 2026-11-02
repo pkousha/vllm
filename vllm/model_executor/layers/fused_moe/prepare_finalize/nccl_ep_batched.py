@@ -10,6 +10,9 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed.device_communicators.all2all import nccl_ep_max_recv_tokens
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.prepare_finalize.nccl_ep import (
+    NcclEPPrepareAndFinalize,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
@@ -44,7 +47,7 @@ def _get_cuda_stream():
     return torch.cuda.current_stream().cuda_stream
 
 
-class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
+class NcclEPBatchedPrepareAndFinalize(NcclEPPrepareAndFinalize):
     """Prepare/Finalize using NCCL EP with EXPERT_MAJOR layout
     (BatchedExperts activation format).
     """
@@ -61,17 +64,13 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         physical_to_global: torch.Tensor | None = None,
         local_expert_global_ids: torch.Tensor | None = None,
     ):
-        super().__init__()
-
-        self.ep_group = ep_group
+        super().__init__(ep_group)
         self.max_tokens_per_rank = max_tokens_per_rank
         if use_fp8_dispatch:
             raise ValueError("NCCL EP FP8 transport is not supported yet; use BF16.")
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.num_dispatchers_ = num_dispatchers
-
-        self.handles: list = [None, None]
 
         topk_indices_dtype = self.topk_indices_dtype()
 
@@ -83,8 +82,6 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.global_to_physical = _maybe_cast(global_to_physical)
         self.physical_to_global = _maybe_cast(physical_to_global)
         self.local_expert_global_ids = _maybe_cast(local_expert_global_ids)
-
-        self._recv_count_buf: torch.Tensor | None = None
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -154,6 +151,7 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> tuple[Callable, mk.ReceiverType]:
+        self._check_not_destroyed()
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("NCCL EP CUDA graph capture is not supported yet.")
         if a1.dtype != torch.bfloat16:
@@ -178,11 +176,11 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
 
-        ep_handle = self.ep_group.create_handle(
+        ep_handle = self._get_handle(
+            a2a_idx,
             nccl_ep.Layout.EXPERT_MAJOR,
-            _to_nccl_tensor(dispatch_topk_ids),
-            config=nccl_ep.HandleConfig(),
-            stream=stream,
+            dispatch_topk_ids,
+            (a1, topk_ids, topk_weights),
         )
 
         max_recv = nccl_ep_max_recv_tokens(
@@ -199,6 +197,7 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             device=a1.device,
         )
 
+        self._tensors[a2a_idx].extend((recv_tokens, recv_count))
         dispatch_inputs = nccl_ep.DispatchInputs(
             tokens=_to_nccl_tensor(a1),
         )
@@ -209,6 +208,9 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_counters=_to_nccl_tensor(recv_count),
         )
 
+        self._descriptors[a2a_idx].extend(
+            (dispatch_inputs, dispatch_outputs, dispatch_layout)
+        )
         ep_handle.dispatch(
             dispatch_inputs,
             dispatch_outputs,
@@ -217,11 +219,10 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             stream=stream,
         )
 
-        self.handles[a2a_idx] = ep_handle
-        self._recv_count_buf = recv_count
+        self._pending[a2a_idx] = torch.cuda.current_stream()
 
         def hook():
-            ep_handle.complete(stream=_get_cuda_stream())
+            self._complete(a2a_idx)
 
         return (
             hook,
@@ -282,6 +283,7 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
         do_async: bool,
     ) -> tuple[Callable, Callable]:
+        self._check_not_destroyed()
         assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate), (
             "Weight application and reduction happens in the combine kernel."
         )
@@ -300,6 +302,9 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         dbo_maybe_run_recv_hook()
 
+        self._tensors[a2a_idx].extend(
+            (fused_expert_output, output, combine_topk_weights)
+        )
         combine_inputs = nccl_ep.CombineInputs(
             tokens=_to_nccl_tensor(fused_expert_output),
         )
@@ -308,6 +313,7 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             topk_weights=_to_nccl_tensor(combine_topk_weights),
         )
 
+        self._descriptors[a2a_idx].extend((combine_inputs, combine_outputs))
         ep_handle.combine(
             combine_inputs,
             combine_outputs,
@@ -315,10 +321,12 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             stream=stream,
         )
 
-        def recv_hook():
-            ep_handle.complete(stream=_get_cuda_stream())
+        self._pending[a2a_idx] = torch.cuda.current_stream()
 
-        return recv_hook, lambda: None
+        def recv_hook():
+            self._complete(a2a_idx)
+
+        return recv_hook, lambda: self._finish(a2a_idx)
 
     def finalize_async(
         self,
@@ -348,7 +356,7 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
-        self._finalize(
+        hook, receiver = self._finalize(
             output,
             fused_expert_output,
             topk_weights,
@@ -357,3 +365,5 @@ class NcclEPBatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             weight_and_reduce_impl,
             do_async=False,
         )
+        hook()
+        receiver()

@@ -39,9 +39,18 @@ are explicitly local at the NCCL boundary, then valid IDs are offset to vLLM's
 global expert IDs. With multiple EP ranks, invalid slots use a nonlocal global
 ID that the expert map filters out, with zero routing weight; single-rank EP
 retains `-1` for invalid slots.
-The initial correctness baseline is eager-only. CUDA graph capture is rejected;
-handle reuse, graph resource lifetime, and leak-free teardown still require the
-separate ownership work before production use.
+The initial correctness baseline is eager-only. CUDA graph capture is rejected.
+Each adapter reuses one native handle per microbatch slot and retains routing,
+activation, and output tensors until that slot's work completes. Completed
+activation buffers return to PyTorch through stream-aware allocator tracking;
+only the routing tensor stays attached to an idle handle. Reuse waits for
+the preceding invocation's completion event before replacing its tensors.
+The all-to-all manager owns adapters created by the backend factory and drains
+staged communication before destroying handles, groups, and the communicator,
+in that order. Direct adapter users must call `destroy()` before destroying their
+group. Teardown is idempotent; using a destroyed adapter is rejected.
+CUDA graph resource lifetime, full DBO scheduling, and multi-node validation are
+still required before production use.
 
 ### Backend Selection Guide
 

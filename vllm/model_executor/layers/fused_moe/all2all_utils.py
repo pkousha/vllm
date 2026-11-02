@@ -376,6 +376,8 @@ def maybe_make_prepare_finalize(
                 use_fp8_dispatch=False,
             )
 
+        all2all_manager.register_prepare_finalize(prepare_finalize)
+
     elif moe.use_moonep_kernels:
         all_to_all_args = dict(
             max_num_tokens_per_dp_rank=moe.max_num_tokens,

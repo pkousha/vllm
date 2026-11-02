@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Real NCCL-EP regressions; run in the pinned four-GPU CUDA 13 environment."""
 
+import gc
+import threading
+import weakref
 from dataclasses import replace
 
 import pytest
@@ -67,7 +70,11 @@ def _bootstrap_worker(
         assert result.item() == sum(r + 1 for r in memberships[index])
         if adapter:
             _check_dispatch(manager)
-        if kernel_backend == "batched":
+        if kernel_backend is not None and kernel_backend.startswith("dbo_"):
+            _check_dbo_lifetime(manager, kernel_backend.removeprefix("dbo_"))
+        elif kernel_backend is not None and kernel_backend.startswith("lifetime_"):
+            _check_lifetime(manager, kernel_backend.removeprefix("lifetime_"))
+        elif kernel_backend == "batched":
             _check_batched(manager)
         elif kernel_backend is not None:
             _check_experts(manager, kernel_backend)
@@ -217,7 +224,8 @@ def _check_dispatch(manager):
         torch.accelerator.synchronize()
         expected = x * (weights * (ids >= 0)).sum(dim=1, keepdim=True).to(x.dtype)
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
-        prepare.handles[0].destroy()
+
+    prepare.destroy()
 
 
 def test_standard_dispatch_uses_ep_capacity_and_valid_topk_metadata(tmp_path):
@@ -337,7 +345,8 @@ def _check_experts(manager, backend):
             )
         torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
         torch.accelerator.synchronize()
-        prepare.handles[0].destroy()
+
+    prepare.destroy()
 
 
 @pytest.mark.parametrize("backend", ["triton", "deep_gemm"])
@@ -427,7 +436,7 @@ def _check_batched(manager):
     receiver()
     torch.accelerator.synchronize()
     torch.testing.assert_close(output, x, rtol=0, atol=0)
-    prepare.handles[0].destroy()
+    prepare.destroy()
 
 
 def test_batched_counts_padding_and_invalid_remapping(tmp_path):
@@ -440,7 +449,7 @@ def test_batched_counts_padding_and_invalid_remapping(tmp_path):
     )
 
 
-def _make_prepare(manager, activation_format):
+def _make_prepare(manager, activation_format, routing_tables=None):
     from vllm.model_executor.layers.fused_moe.all2all_utils import (
         maybe_make_prepare_finalize,
     )
@@ -481,4 +490,248 @@ def _make_prepare(manager, activation_format):
         config,
         FUSED_MOE_UNQUANTIZED_CONFIG,
         all2all_manager=manager,
+        routing_tables=routing_tables,
+    )
+
+
+def _check_lifetime(manager, activation_format):
+    from vllm.model_executor.layers.fused_moe.config import (
+        FUSED_MOE_UNQUANTIZED_CONFIG,
+    )
+    from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+        TopKWeightAndReduceContiguous,
+        TopKWeightAndReduceDelegate,
+    )
+
+    routing_tables = None
+    if activation_format == "batched":
+        permutation = torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int64)
+        inverse = permutation.argsort()
+        routing_tables = (
+            permutation,
+            inverse,
+            inverse[manager.rank * 2 : manager.rank * 2 + 2],
+        )
+    prepare = _make_prepare(manager, activation_format, routing_tables)
+    pointer = None
+    free_after_warmup = None
+    for iteration in range(20):
+        n = 1 + iteration % 3
+        x = torch.full((n, 1024), iteration + 1, device="cuda", dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 2]] * n, device="cuda", dtype=torch.int64)
+        weights = torch.full((n, 2), 0.5, device="cuda")
+        output = torch.empty_like(x)
+        routing_ref = weakref.ref(ids)
+        result = prepare.prepare_async(
+            x, weights, ids, 4, None, False, FUSED_MOE_UNQUANTIZED_CONFIG
+        )
+        del ids
+        gc.collect()
+        assert routing_ref() is not None, "native routing storage was released"
+        if iteration == 0:
+            with pytest.raises(RuntimeError, match="unfinished invocation"):
+                prepare.prepare_async(
+                    x,
+                    weights,
+                    routing_ref(),
+                    4,
+                    None,
+                    False,
+                    FUSED_MOE_UNQUANTIZED_CONFIG,
+                )
+        pressure = [
+            torch.full((n, 2), -1, device="cuda", dtype=torch.int64) for _ in range(32)
+        ]
+        del pressure
+        if isinstance(result, tuple):
+            hook, receiver = result
+            hook()
+        else:
+            receiver = result
+        received, _, _, recv_ids, recv_weights = receiver()
+        current_pointer = prepare.handles[0].ptr
+        if pointer is None:
+            pointer = current_pointer
+        assert current_pointer == pointer, (
+            "native handle was replaced instead of reused"
+        )
+        if activation_format == "standard":
+            fused = received[:, None, :].expand(-1, 2, -1).clone()
+            reducer = TopKWeightAndReduceContiguous()
+        else:
+            fused = received
+            recv_ids, recv_weights = routing_ref(), weights
+            reducer = TopKWeightAndReduceDelegate()
+        if iteration % 2 == 0:
+            prepare.finalize(output, fused, recv_weights, recv_ids, False, reducer)
+        else:
+            receiver = prepare.finalize_async(
+                output, fused, recv_weights, recv_ids, False, reducer
+            )
+            if isinstance(receiver, tuple):
+                hook, receiver = receiver
+                hook()
+            receiver()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(output, x, rtol=0, atol=0)
+        del result, receiver, received, fused, output, recv_ids, recv_weights
+        gc.collect()
+        torch.accelerator.empty_cache()
+        if iteration == 4:
+            free_after_warmup = torch.accelerator.get_memory_info()[0]
+    assert torch.accelerator.get_memory_info()[0] >= free_after_warmup, (
+        "native allocations grew"
+    )
+    # Teardown must also finish a staged dispatch whose hook was never consumed.
+    ids = torch.tensor([[0, 2]] * x.shape[0], device="cuda", dtype=torch.int64)
+    prepare.prepare_async(x, weights, ids, 4, None, False, FUSED_MOE_UNQUANTIZED_CONFIG)
+    handle = prepare.handles[0]
+    group = prepare.ep_group
+    manager.destroy()
+    with pytest.raises(Exception, match="destroyed"):
+        _ = handle.ptr
+    with pytest.raises(Exception, match="destroyed"):
+        _ = group.ptr
+    with pytest.raises(RuntimeError, match="destroyed"):
+        prepare.prepare(x, weights, ids, 4, None, False, FUSED_MOE_UNQUANTIZED_CONFIG)
+    manager.destroy()
+
+
+@pytest.mark.parametrize("activation_format", ["standard", "batched"])
+def test_native_handle_reuse_retains_routing_and_stabilizes_memory(
+    tmp_path, activation_format
+):
+    """Native allocations stay bounded and teardown invalidates handles first."""
+    assert torch.accelerator.device_count() >= 4
+    mp.spawn(
+        _bootstrap_worker,
+        args=(
+            f"file://{tmp_path}/lifetime",
+            True,
+            False,
+            False,
+            "lifetime_" + activation_format,
+        ),
+        nprocs=4,
+        join=True,
+    )
+
+
+def _check_dbo_lifetime(manager, activation_format):
+    from vllm.forward_context import create_forward_context
+    from vllm.model_executor.layers.fused_moe.config import (
+        FUSED_MOE_UNQUANTIZED_CONFIG,
+    )
+    from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+        TopKWeightAndReduceContiguous,
+        TopKWeightAndReduceDelegate,
+    )
+    from vllm.v1.worker.ubatching import (
+        dbo_maybe_run_recv_hook,
+        dbo_register_recv_hook,
+        dbo_yield,
+        make_ubatch_contexts,
+    )
+
+    prepare = _make_prepare(manager, activation_format)
+    device = torch.accelerator.current_device_index()
+    barrier = threading.Barrier(3)
+    contexts = make_ubatch_contexts(
+        2,
+        torch.cuda.current_stream(),
+        torch.cuda.Stream(),
+        [create_forward_context(None, VllmConfig()) for _ in range(2)],
+        barrier,
+    )
+    pointers: list[set[int]] = [set(), set()]
+    errors: list[BaseException] = []
+
+    def run(context):
+        try:
+            torch.accelerator.set_device_index(device)
+            with context:
+                for iteration in range(8):
+                    dbo_maybe_run_recv_hook()
+                    x = torch.full(
+                        (context.id + 1, 1024),
+                        1 + manager.rank + context.id * 4 + iteration * 8,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    ids = torch.tensor(
+                        [[0, 2]] * x.shape[0], device="cuda", dtype=torch.int64
+                    )
+                    weights = torch.full((x.shape[0], 2), 0.5, device="cuda")
+                    result = prepare.prepare_async(
+                        x, weights, ids, 4, None, False, FUSED_MOE_UNQUANTIZED_CONFIG
+                    )
+                    if isinstance(result, tuple):
+                        hook, receiver = result
+                        dbo_register_recv_hook(hook)
+                        dbo_yield()
+                    else:
+                        receiver = result
+                    received, _, _, recv_ids, recv_weights = receiver()
+                    pointers[context.id].add(prepare.handles[context.id].ptr)
+                    if activation_format == "standard":
+                        fused = received[:, None, :].expand(-1, 2, -1).clone()
+                        reducer = TopKWeightAndReduceContiguous()
+                    else:
+                        fused = received
+                        recv_ids, recv_weights = ids, weights
+                        reducer = TopKWeightAndReduceDelegate()
+                    output = torch.empty_like(x)
+                    result = prepare.finalize_async(
+                        output, fused, recv_weights, recv_ids, False, reducer
+                    )
+                    if isinstance(result, tuple):
+                        hook, receiver = result
+                        dbo_register_recv_hook(hook)
+                        dbo_yield()
+                    else:
+                        receiver = result
+                    receiver()
+                    torch.testing.assert_close(output, x, rtol=0, atol=0)
+                    dbo_maybe_run_recv_hook()
+                    dbo_yield()
+        except BaseException as error:
+            errors.append(error)
+            for context in contexts:
+                context.cpu_wait_event.set()
+
+    threads = [threading.Thread(target=run, args=(c,), daemon=True) for c in contexts]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=30)
+    contexts[0].cpu_wait_event.set()
+    for thread in threads:
+        thread.join(timeout=120)
+        assert not thread.is_alive(), "microbatch scheduling did not finish"
+    if errors:
+        raise errors[0]
+    assert all(len(slot) == 1 for slot in pointers)
+    assert pointers[0].isdisjoint(pointers[1])
+    handles = list(prepare.handles)
+    manager.destroy()
+    for handle in handles:
+        with pytest.raises(Exception, match="destroyed"):
+            _ = handle.ptr
+
+
+@pytest.mark.parametrize("activation_format", ["standard", "batched"])
+def test_native_handle_lifetime_isolated_between_microbatch_slots(
+    tmp_path, activation_format
+):
+    assert torch.accelerator.device_count() >= 4
+    mp.spawn(
+        _bootstrap_worker,
+        args=(
+            f"file://{tmp_path}/dbo",
+            True,
+            False,
+            False,
+            "dbo_" + activation_format,
+        ),
+        nprocs=4,
+        join=True,
     )
