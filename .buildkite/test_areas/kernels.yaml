@@ -968,6 +968,25 @@ steps:
       commands:
       - pytest -v -s kernels/moe/test_deepep_moe.py
 
+- label: ":nvidia: (B200) NCCL-EP correctness"
+  key: kernels-nccl-ep-test-4xb200
+  timeout_in_minutes: 30
+  device: b200-k8s
+  num_devices: 4
+  source_file_dependencies:
+  - vllm/distributed/device_communicators/all2all.py
+  - vllm/distributed/device_communicators/cuda_communicator.py
+  - vllm/model_executor/layers/fused_moe/
+  - vllm/config/parallel.py
+  - vllm/utils/import_utils.py
+  - requirements/nccl_ep.txt
+  - tests/kernels/moe/test_nccl_ep_prepare_finalize.py
+  - tests/kernels/moe/test_deepgemm.py
+  - tests/kernels/moe/utils.py
+  commands:
+    - uv pip install --system -r ../requirements/nccl_ep.txt
+    - pytest -v -s kernels/moe/test_nccl_ep_prepare_finalize.py
+
 - label: ":nvidia: (B200) [Nightly] FP4 MoE Kernels"
   key: kernels-fp4-moe-test-b200
   automatic_shard: true
