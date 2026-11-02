@@ -74,8 +74,8 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             raise ValueError("NCCL EP handle reuse requires a constant top-k.")
         done = self._done[index]
         if done is not None:
-            # shortcut: host wait before reuse; defer stream-aware retention to tuning.
-            done.synchronize()
+            # Preserve ordering if this slot is reused on another stream.
+            torch.cuda.current_stream().wait_event(done)
         self._tensors[index] = [routing, *tensors]
         self._active[index] = True
         stream = _get_cuda_stream()

@@ -43,8 +43,8 @@ The initial correctness baseline is eager-only. CUDA graph capture is rejected.
 Each adapter reuses one native handle per microbatch slot and retains routing,
 activation, and output tensors until that slot's work completes. Completed
 activation buffers return to PyTorch through stream-aware allocator tracking;
-only the routing tensor stays attached to an idle handle. Reuse waits for
-the preceding invocation's completion event before replacing its tensors.
+only the routing tensor stays attached to an idle handle. New work waits on
+the preceding invocation's completion event on the GPU.
 The all-to-all manager owns adapters created by the backend factory and drains
 staged communication before destroying handles, groups, and the communicator,
 in that order. Direct adapter users must call `destroy()` before destroying their
