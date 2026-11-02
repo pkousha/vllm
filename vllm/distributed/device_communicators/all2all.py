@@ -1359,29 +1359,43 @@ class MoonEPAll2AllManager(All2AllManagerBase):
             self.handle_cache._cache.clear()
 
 
+def nccl_ep_max_recv_tokens(max_dispatch_tokens_per_rank: int, ep_size: int) -> int:
+    """Bound FLAT rows or rows per LL expert by all EP senders."""
+    return max_dispatch_tokens_per_rank * ep_size
+
+
 class NcclEPAll2AllManager(All2AllManagerBase):
-    """
-    All2All communication based on NCCL EP (Expert Parallelism) kernels.
+    """All2All communication based on NCCL EP (Expert Parallelism) kernels.
     Supports both batched (expert-major) and standard (flat) modes
     via a single backend.
     """
 
     def __init__(self, cpu_group, tcp_store_group=None):
         assert has_nccl_ep(), (
-            "NCCL EP not available. Install nccl4py with EP support: "
-            "pip install 'nccl4py[cu13]'"
+            "NCCL EP requires nccl4py and nccl-extensions. Install "
+            "requirements/nccl_ep.txt in a CUDA 13 environment."
         )
         super().__init__(cpu_group, tcp_store_group)
 
         import nccl.core as nccl_core  # type: ignore[import-not-found]
 
-        unique_id = (
-            nccl_core.get_unique_id() if self.rank == 0 else None
-        )
+        version = nccl_core.get_version().libnccl
+        if version is None or version.version.release < (2, 30, 7):
+            raise RuntimeError(
+                f"NCCL EP requires loaded NCCL >= 2.30.7; got {version}. "
+                "See requirements/nccl_ep.txt and check LD_LIBRARY_PATH."
+            )
 
-        unique_id_list = [unique_id]
-        dist.broadcast_object_list(unique_id_list, src=0, group=cpu_group)
-        unique_id = unique_id_list[0]
+        unique_id = nccl_core.get_unique_id() if self.rank == 0 else None
+
+        if tcp_store_group is not None:
+            unique_id = tcp_store_group.broadcast_obj(unique_id, src=0)
+        else:
+            unique_id_list = [unique_id]
+            root = dist.get_process_group_ranks(cpu_group)[0]
+            dist.broadcast_object_list(unique_id_list, src=root, group=cpu_group)
+            unique_id = unique_id_list[0]
+        assert unique_id is not None, "NCCL EP bootstrap did not receive a unique ID"
 
         logger.info(
             "Initializing NCCL EP communicator: rank=%d, world_size=%d",
@@ -1394,18 +1408,10 @@ class NcclEPAll2AllManager(All2AllManagerBase):
             unique_id=unique_id,
         )
         logger.info(
-            "NCCL EP communicator initialized: rank=%d, world_size=%d, "
-            "device=%s, gin_type=%s, railed_gin_type=%s, n_lsa_teams=%s, "
-            "device_api_support=%s, host_rma_support=%s, multimem_support=%s",
+            "NCCL EP communicator initialized: rank=%d, world_size=%d, device=%s",
             self.rank,
             self.world_size,
             self.nccl_comm.device,
-            self.nccl_comm.gin_type,
-            self.nccl_comm.railed_gin_type,
-            self.nccl_comm.n_lsa_teams,
-            self.nccl_comm.device_api_support,
-            self.nccl_comm.host_rma_support,
-            self.nccl_comm.multimem_support,
         )
 
         self._ep_groups: dict[tuple[int, int, int, int], Any] = {}
@@ -1429,8 +1435,8 @@ class NcclEPAll2AllManager(All2AllManagerBase):
 
         with self._lock:
             if key not in self._ep_groups:
-                max_recv_tokens_per_rank = (
-                    max_dispatch_tokens_per_rank * self.world_size
+                max_recv_tokens_per_rank = nccl_ep_max_recv_tokens(
+                    max_dispatch_tokens_per_rank, self.world_size
                 )
                 config = nccl_ep.GroupConfig(
                     algorithm=algorithm,
@@ -1453,9 +1459,7 @@ class NcclEPAll2AllManager(All2AllManagerBase):
                     max_token_bytes,
                 )
                 try:
-                    self._ep_groups[key] = nccl_ep.Group.create(
-                        self.nccl_comm, config
-                    )
+                    self._ep_groups[key] = nccl_ep.Group.create(self.nccl_comm, config)
                 except Exception:
                     logger.exception(
                         "NCCL EP group creation failed: rank=%d, "
@@ -1477,13 +1481,24 @@ class NcclEPAll2AllManager(All2AllManagerBase):
         import nccl.ep as nccl_ep  # type: ignore[import-not-found]
 
         algorithm_str = kwargs.get("algorithm", "standard")
+        if algorithm_str not in ("standard", "batched"):
+            raise ValueError(f"Unknown NCCL EP activation format: {algorithm_str}")
         algorithm = (
             nccl_ep.Algorithm.LOW_LATENCY
             if algorithm_str == "batched"
             else nccl_ep.Algorithm.HIGH_THROUGHPUT
         )
         num_experts = kwargs["num_experts"]
+        if num_experts <= 0 or num_experts % self.world_size:
+            raise ValueError(
+                f"NCCL EP requires {num_experts} experts to split evenly "
+                f"over {self.world_size} EP ranks."
+            )
         max_dispatch_tokens_per_rank = kwargs["max_dispatch_tokens_per_rank"]
+        if max_dispatch_tokens_per_rank <= 0:
+            raise ValueError(
+                "NCCL EP requires a positive maximum dispatch token count."
+            )
         hidden = kwargs["hidden"]
         dtype_bytes = kwargs.get("dtype_bytes", 2)  # bf16 default
         max_token_bytes = hidden * dtype_bytes

@@ -520,8 +520,8 @@ def has_deep_gemm() -> bool:
 
 
 def has_nccl_ep() -> bool:
-    """Whether the optional `nccl4py` package with EP support is available."""
-    return _has_module("nccl.ep")
+    """Whether nccl4py and the optional nccl-extensions EP bindings are available."""
+    return _has_module("nccl.core") and _has_module("nccl.ep")
 
 
 def has_nixl_ep() -> bool:

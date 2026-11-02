@@ -17,6 +17,32 @@ Before using EP, you need to install the necessary dependencies. We are actively
     NCCL, so you must upgrade it before building or running DeepEP. See the
     [EP kernels guide](../../tools/ep_kernels) for instructions.
 
+### Direct NCCL-EP (experimental)
+
+The direct `nccl_ep` backend uses separate `nccl4py` communicator bindings and
+`nccl-extensions` EP bindings. For the CUDA 13 BF16 baseline, install the pinned
+optional dependencies with `uv pip install -r requirements/nccl_ep.txt`:
+NCCL 2.30.7, nccl4py 0.5.0, and nccl-extensions 0.1.0 (EP native API 2).
+Check `nccl.core.get_version()` for the **loaded** NCCL library; package metadata
+and PyTorch's compiled NCCL version alone do not identify it.
+
+Select `--all2all-backend nccl_ep --enforce-eager` and
+`--nccl-ep-activation-format standard` (HT/FLAT) or `batched` (LL/EXPERT_MAJOR).
+Transport is BF16; quantized expert kernels quantize locally after dispatch.
+FP8 transport is rejected until its quantization recipe is implemented.
+NCCL-EP requires a positive expert count divisible by EP size. EP and DP sizes
+can differ, and EP subgroups can exclude global rank zero or use noncontiguous
+membership. Standard receive capacity is the configured maximum sender token
+count multiplied by EP size; only the native receive count reaches the experts.
+Native expert counters include all valid local top-k assignments. Received IDs
+are explicitly local at the NCCL boundary, then valid IDs are offset to vLLM's
+global expert IDs. With multiple EP ranks, invalid slots use a nonlocal global
+ID that the expert map filters out, with zero routing weight; single-rank EP
+retains `-1` for invalid slots.
+The initial correctness baseline is eager-only. CUDA graph capture is rejected;
+handle reuse, graph resource lifetime, and leak-free teardown still require the
+separate ownership work before production use.
+
 ### Backend Selection Guide
 
 vLLM provides multiple communication backends for EP. Use `--all2all-backend` to select one:

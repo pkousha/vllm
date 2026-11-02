@@ -322,20 +322,18 @@ def maybe_make_prepare_finalize(
         )
 
     elif moe.use_nccl_ep_kernels:
+        if moe.in_dtype != torch.bfloat16:
+            raise ValueError("NCCL EP currently requires BF16 transport inputs.")
         if moe.moe_parallel_config.use_batched_activation_format:
             assert quant_config is not None
-            global_to_physical = physical_to_global = (
-                local_expert_global_ids
-            ) = None
+            global_to_physical = physical_to_global = local_expert_global_ids = None
             if routing_tables is not None:
                 (
                     global_to_physical,
                     physical_to_global,
                     local_expert_global_ids,
                 ) = routing_tables
-            num_local_experts = (
-                moe.num_experts // all2all_manager.world_size
-            )
+            num_local_experts = moe.num_experts // all2all_manager.world_size
             all_to_all_args = dict(
                 algorithm="batched",
                 num_experts=moe.num_experts,
@@ -345,29 +343,19 @@ def maybe_make_prepare_finalize(
             )
             handle = all2all_manager.get_handle(all_to_all_args)
 
-            use_fp8_dispatch = (
-                quant_config.quant_dtype == current_platform.fp8_dtype()
-                and quant_config.is_block_quantized
-            )
-
             prepare_finalize = NcclEPBatchedPrepareAndFinalize(
                 handle,
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 num_experts=moe.num_experts,
                 num_local_experts=num_local_experts,
-                use_fp8_dispatch=use_fp8_dispatch,
+                use_fp8_dispatch=False,
                 global_to_physical=global_to_physical,
                 physical_to_global=physical_to_global,
                 local_expert_global_ids=local_expert_global_ids,
             )
         else:
             assert moe.dp_size == all2all_manager.dp_world_size
-            use_fp8_dispatch = (
-                quant_config is not None
-                and quant_config.quant_dtype == current_platform.fp8_dtype()
-                and quant_config.is_block_quantized
-            )
             all_to_all_args = dict(
                 algorithm="standard",
                 num_experts=moe.num_experts,
@@ -382,10 +370,10 @@ def maybe_make_prepare_finalize(
                 num_dispatchers=all2all_manager.world_size,
                 dp_size=all2all_manager.dp_world_size,
                 max_tokens_per_rank=moe.max_num_tokens,
-                rank_expert_offset=(all2all_manager.rank * moe.num_local_experts),
+                rank_expert_offset=all2all_manager.rank * moe.num_local_experts,
                 num_experts=moe.num_experts,
                 num_topk=moe.experts_per_token,
-                use_fp8_dispatch=use_fp8_dispatch,
+                use_fp8_dispatch=False,
             )
 
     elif moe.use_moonep_kernels:

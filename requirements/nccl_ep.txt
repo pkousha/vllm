@@ -1,0 +1,4 @@
+# Optional direct NCCL-EP backend (CUDA 13).
+nccl4py[cu13]==0.5.0
+nccl-extensions[cu13]==0.1.0
+nvidia-nccl-cu13==2.30.7
