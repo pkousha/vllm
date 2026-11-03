@@ -15,6 +15,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.utils.torch_utils import aux_stream
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
@@ -220,6 +221,7 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
         self.num_experts = num_experts
         self.num_topk = num_topk
         self.use_fp8_dispatch = use_fp8_dispatch
+        self._combine_stream = aux_stream()
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -515,7 +517,6 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
             fused_expert_output = fused_expert_output.reshape(0, output.shape[-1])
 
         dbo_yield_and_switch_from_compute_to_comm()
-        stream = _get_cuda_stream()
 
         assert fused_expert_output.dtype == torch.bfloat16, (
             f"NCCL EP combine requires bfloat16, got {fused_expert_output.dtype}"
@@ -544,13 +545,22 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
             tokens=_to_nccl_tensor(combined_output),
         )
 
-        ep_handle.combine(
-            combine_inputs,
-            combine_outputs,
-            config=nccl_ep.CombineConfig(send_only=0),
-            stream=stream,
-        )
-        ep_handle.complete(stream=stream)
+        combine_stream = torch.cuda.current_stream()
+        if do_async and not dbo_enabled():
+            assert self._combine_stream is not None
+            combine_stream = self._combine_stream
+            if combine_stream != torch.cuda.current_stream():
+                # PERF_REVIEW(pkousha): Fork/join permits shared-expert overlap;
+                # measure the two GPU handoffs against the overlap they enable.
+                combine_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(combine_stream):
+            ep_handle.combine(
+                combine_inputs,
+                combine_outputs,
+                config=nccl_ep.CombineConfig(send_only=0),
+                stream=combine_stream.cuda_stream,
+            )
+            ep_handle.complete(stream=combine_stream.cuda_stream)
 
         dbo_switch_to_compute()
 
@@ -558,6 +568,9 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
 
             def _receiver():
                 dbo_switch_to_comm()
+                consumer = torch.cuda.current_stream()
+                if consumer != combine_stream:
+                    consumer.wait_stream(combine_stream)
                 if combined_output is not output:
                     output.copy_(combined_output, non_blocking=True)
                 dbo_yield_and_switch_from_comm_to_compute()

@@ -3,10 +3,12 @@
 """Real NCCL-EP regressions; run in the pinned four-GPU CUDA 13 environment."""
 
 import gc
+import json
 import threading
 import weakref
 from contextlib import nullcontext
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -86,7 +88,11 @@ def _bootstrap_worker(
         elif kernel_backend == "combine_buffers":
             _check_combine_buffers(manager)
         elif kernel_backend is not None:
-            _check_experts(manager, kernel_backend)
+            _check_experts(
+                manager,
+                kernel_backend,
+                init_method.removeprefix("file://") + f"-rank{rank}.json",
+            )
         manager.destroy()
         dist.barrier()
         destroy_model_parallel()
@@ -230,7 +236,7 @@ def test_standard_dispatch_uses_ep_capacity_and_valid_topk_metadata(tmp_path):
     )
 
 
-def _check_experts(manager, backend):
+def _check_experts(manager, backend, trace_path):
     from vllm.forward_context import set_forward_context
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.config import (
@@ -251,12 +257,15 @@ def _check_experts(manager, backend):
     from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
         make_moe_prepare_and_finalize_no_dp_ep,
     )
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
     from vllm.platforms import current_platform
     from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
     from vllm.v1.worker.workspace import init_workspace_manager
 
     from .utils import make_dummy_moe_config, make_test_weights
 
+    use_shared = backend.startswith("shared_")
+    backend = backend.removeprefix("shared_")
     torch.manual_seed(42)
     init_workspace_manager(
         torch.device("cuda", torch.accelerator.current_device_index())
@@ -335,6 +344,14 @@ def _check_experts(manager, backend):
         else expert_type(config, quant)
     )
     kernel = FusedMoEKernel(prepare, experts)
+    shared = shared_layer = None
+    if use_shared:
+        shared_layer = torch.nn.Linear(
+            1024, 1024, bias=False, dtype=torch.bfloat16, device="cuda"
+        ).requires_grad_(False)
+        shared = SharedExperts(
+            shared_layer, config, False, lambda: kernel.can_overlap_shared_experts
+        )
     if backend == "batched_deep_gemm":
         from vllm.model_executor.layers.fused_moe.prepare_finalize.batched import (
             BatchedPrepareAndFinalize,
@@ -370,23 +387,71 @@ def _check_experts(manager, backend):
         [[0, 1]] * 3,
         [[2, 3]] * 3,
     )
-    for route in routes:
+    for iteration, route in enumerate(routes):
         ids = torch.tensor(route, device="cuda", dtype=torch.int64)
         with set_forward_context(None, VllmConfig()):
             expected = reference.apply(
                 x, w1, w2, weights, ids, MoEActivation.SILU, 4, None, False
             )
-            actual = kernel.apply(
-                hidden_states=x,
-                w1=w1[offset : offset + 2],
-                w2=w2[offset : offset + 2],
-                topk_weights=weights,
-                topk_ids=ids,
-                activation=MoEActivation.SILU,
-                global_num_experts=4,
-                expert_map=expert_map,
-                apply_router_weight_on_input=False,
-            )
+            profiling = use_shared and iteration == len(routes) - 1
+            with (
+                torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ]
+                )
+                if profiling
+                else nullcontext()
+            ) as profile:
+                actual = kernel.apply(
+                    hidden_states=x,
+                    w1=w1[offset : offset + 2],
+                    w2=w2[offset : offset + 2],
+                    topk_weights=weights,
+                    topk_ids=ids,
+                    activation=MoEActivation.SILU,
+                    global_num_experts=4,
+                    expert_map=expert_map,
+                    apply_router_weight_on_input=False,
+                    shared_experts=shared,
+                    shared_experts_input=x if use_shared else None,
+                )
+            if shared is not None and shared_layer is not None:
+                torch.testing.assert_close(
+                    shared.output, shared_layer(x), rtol=0, atol=0
+                )
+            if profile is not None:
+                profile.export_chrome_trace(trace_path)
+                events = json.loads(Path(trace_path).read_text())["traceEvents"]
+                linear = next(e for e in events if e["name"] == "aten::linear")
+                launches = {
+                    e["args"]["correlation"]: e
+                    for e in events
+                    if e.get("cat") in ("cuda_runtime", "cuda_driver")
+                }
+                combine = next(
+                    e for e in events if e["name"] == "nccl_ep_jit_ht_combine_kernel"
+                )
+                shared_kernels = [
+                    e
+                    for e in events
+                    if e.get("cat") == "kernel"
+                    and linear["ts"]
+                    <= launches[e["args"]["correlation"]]["ts"]
+                    <= linear["ts"] + linear["dur"]
+                ]
+                assert shared_kernels
+                assert all(
+                    e["args"]["stream"] != combine["args"]["stream"]
+                    for e in shared_kernels
+                ), "Standard combine serializes shared experts on the compute stream"
+                combine_launch = launches[combine["args"]["correlation"]]
+                assert not any(
+                    e["name"] == "cudaStreamWaitEvent"
+                    and combine_launch["ts"] < e["ts"] < linear["ts"] + linear["dur"]
+                    for e in events
+                ), "Combine is joined before shared experts are enqueued"
         torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
         torch.accelerator.synchronize()
 
@@ -402,8 +467,13 @@ def _check_experts(manager, backend):
             global_num_experts=4,
             expert_map=expert_map,
             apply_router_weight_on_input=False,
+            shared_experts=shared,
+            shared_experts_input=x if use_shared else None,
         )
+        shared_output = shared.output if shared is not None else None
     for route in routes:
+        if use_shared:
+            x.add_(0.01)
         ids.copy_(torch.tensor(route, device="cuda", dtype=torch.int64))
         with set_forward_context(None, VllmConfig()):
             expected = reference.apply(
@@ -411,6 +481,8 @@ def _check_experts(manager, backend):
             )
         graph.replay()
         torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
+        if shared_output is not None and shared_layer is not None:
+            torch.testing.assert_close(shared_output, shared_layer(x), rtol=0, atol=0)
     del graph
     prepare.destroy()
 
@@ -424,6 +496,18 @@ def test_expert_kernels_consume_dispatch_metadata(tmp_path, backend):
     mp.spawn(
         _bootstrap_worker,
         args=(f"file://{tmp_path}/experts", True, False, False, backend),
+        nprocs=4,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("backend", ["triton", "deep_gemm_fp8"])
+def test_standard_combine_overlaps_shared_experts_without_dbo(tmp_path, backend):
+    """Independent combine and shared GEMM streams join only after shared launch."""
+    assert torch.accelerator.device_count() >= 4
+    mp.spawn(
+        _bootstrap_worker,
+        args=(f"file://{tmp_path}/shared", True, False, False, f"shared_{backend}"),
         nprocs=4,
         join=True,
     )

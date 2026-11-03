@@ -67,6 +67,11 @@ preceding invocation's completion event on the GPU; reuse on the same stream
 uses its existing ordering. Standard combine writes directly to a contiguous,
 16-byte-aligned caller output that does not share storage with the combine input.
 Other output views use a temporary followed by a copy.
+Without DBO, Standard asynchronous combine runs on the process's auxiliary stream
+so shared experts can run on the compute stream. Combine waits for its inputs;
+the returned receiver joins combine after shared experts have been queued.
+These GPU dependencies are captured in CUDA graphs and do not wait on the CPU.
+With DBO, Standard keeps using the scheduler's communication stream.
 The all-to-all manager owns adapters created by the backend factory and drains
 staged communication before destroying handles, groups, and the communicator,
 in that order. Direct adapter users must call `destroy()` before destroying their
