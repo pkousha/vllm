@@ -86,7 +86,10 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.handles: list[nccl_ep.Handle | None] = [None, None]
         self._tensors: list[list[torch.Tensor]] = [[], []]
         self._descriptors: list[list[object]] = [[], []]
-        self._done: list[torch.cuda.Event | None] = [None, None]
+        self._done: list[tuple[torch.cuda.Event, torch.cuda.Stream] | None] = [
+            None,
+            None,
+        ]
         self._pending: list[torch.cuda.Stream | None] = [None, None]
         self._active = [False, False]
         self._num_topk: int | None = None
@@ -108,13 +111,15 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if handle is None and capturing:
             raise RuntimeError("Warm up NCCL EP before CUDA graph capture.")
         done = self._done[index]
-        if capturing:
-            # Capture/replay must be ordered by the caller after eager work.
-            self._done[index] = None
-        elif done is not None:
-            # PERF_REVIEW(pkousha): This GPU wait may be redundant; verify whether
-            # existing stream handoffs already order reuse across streams.
-            torch.cuda.current_stream().wait_event(done)
+        self._done[index] = None
+        # Capture/replay must be ordered by the caller after eager work.
+        if not capturing and done is not None:
+            event, producer = done
+            consumer = torch.cuda.current_stream(routing.device)
+            if consumer != producer:
+                # PERF_REVIEW(pkousha): DBO may already order this reuse;
+                # other cross-stream callers still need the dependency.
+                consumer.wait_event(event)
         self._tensors[index] = [routing, *tensors]
         self._devices.add(routing.device)
         self._active[index] = True
@@ -141,22 +146,20 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if pending is not None:
             handle = self.handles[index]
             assert handle is not None
+            consumer = torch.cuda.current_stream(pending.device)
             # The pinned LL continuation launches on the original send stream.
             with torch.cuda.stream(pending):
                 handle.complete(stream=pending.cuda_stream)
-                done = torch.cuda.Event()
-                done.record(pending)
-            torch.cuda.current_stream(pending.device).wait_event(done)
-            self._done[index] = done
+                if consumer != pending:
+                    done = torch.cuda.Event()
+                    done.record(pending)
+                    consumer.wait_event(done)
             self._pending[index] = None
 
     def _finish(self, index):
         self._check_not_destroyed()
         assert self._pending[index] is None
         stream = torch.cuda.current_stream()
-        previous = self._done[index]
-        if previous is not None:
-            stream.wait_event(previous)
         # PERF_REVIEW(pkousha): Check which allocator stream records are necessary;
         # prove ownership under allocator pressure before removing them.
         for tensor in self._tensors[index]:
@@ -171,7 +174,7 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             self._tensors[index] = self._tensors[index][:1]
             done = torch.cuda.Event()
             done.record(stream)
-            self._done[index] = done
+            self._done[index] = (done, stream)
         self._active[index] = False
 
     def destroy(self):
@@ -518,8 +521,21 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
             f"NCCL EP combine requires bfloat16, got {fused_expert_output.dtype}"
         )
 
-        combined_output = torch.empty_like(output)
-        self._tensors[a2a_idx].extend((fused_expert_output, combined_output, output))
+        combined_output = output
+        if (
+            not output.is_contiguous()
+            or output.data_ptr() % 16 != 0
+            or output.untyped_storage().data_ptr()
+            == fused_expert_output.untyped_storage().data_ptr()
+        ):
+            # PERF_REVIEW(pkousha): Native HT stores need aligned, contiguous,
+            # disjoint output; keep the temporary/copy for incompatible views.
+            combined_output = torch.empty_like(
+                output, memory_format=torch.contiguous_format
+            )
+        self._tensors[a2a_idx].extend((fused_expert_output, output))
+        if combined_output is not output:
+            self._tensors[a2a_idx].append(combined_output)
 
         combine_inputs = nccl_ep.CombineInputs(
             tokens=_to_nccl_tensor(fused_expert_output),
@@ -542,14 +558,16 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
 
             def _receiver():
                 dbo_switch_to_comm()
-                output.copy_(combined_output, non_blocking=True)
+                if combined_output is not output:
+                    output.copy_(combined_output, non_blocking=True)
                 dbo_yield_and_switch_from_comm_to_compute()
                 self._finish(a2a_idx)
 
             return _receiver
         else:
             assert not dbo_enabled()
-            output.copy_(combined_output, non_blocking=True)
+            if combined_output is not output:
+                output.copy_(combined_output, non_blocking=True)
             self._finish(a2a_idx)
             return None
 

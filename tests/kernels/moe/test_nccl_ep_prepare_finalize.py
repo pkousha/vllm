@@ -73,12 +73,18 @@ def _bootstrap_worker(
             _check_dispatch(manager)
         if kernel_backend is not None and kernel_backend.startswith("graph_"):
             _check_transport_graph(manager, kernel_backend.removeprefix("graph_"))
+        elif kernel_backend is not None and kernel_backend.startswith("streams_"):
+            _check_transport_graph(
+                manager, kernel_backend.removeprefix("streams_"), cross_stream=True
+            )
         elif kernel_backend is not None and kernel_backend.startswith("dbo_"):
             _check_dbo_lifetime(manager, kernel_backend.removeprefix("dbo_"))
         elif kernel_backend is not None and kernel_backend.startswith("lifetime_"):
             _check_lifetime(manager, kernel_backend.removeprefix("lifetime_"))
         elif kernel_backend == "batched":
             _check_batched(manager)
+        elif kernel_backend == "combine_buffers":
+            _check_combine_buffers(manager)
         elif kernel_backend is not None:
             _check_experts(manager, kernel_backend)
         manager.destroy()
@@ -469,6 +475,18 @@ def _check_batched(manager):
     )
     ids = torch.tensor([[2, 3]] * x.shape[0], device="cuda", dtype=torch.int64)
     weights = torch.tensor([[0.25, 0.75]] * x.shape[0], device="cuda")
+    for entrypoint in (prepare.prepare_async, prepare.prepare):
+        with pytest.raises(NotImplementedError, match="defer_input_quant=True"):
+            entrypoint(
+                x,
+                weights,
+                ids,
+                4,
+                None,
+                False,
+                FUSED_MOE_UNQUANTIZED_CONFIG,
+                defer_input_quant=True,
+            )
     hook, receiver = prepare.prepare_async(
         x,
         weights,
@@ -506,6 +524,95 @@ def test_batched_counts_padding_and_invalid_remapping(tmp_path):
     mp.spawn(
         _bootstrap_worker,
         args=(f"file://{tmp_path}/batched", True, False, False, "batched"),
+        nprocs=4,
+        join=True,
+    )
+
+
+def _check_combine_buffers(manager):
+    from vllm.model_executor.layers.fused_moe.config import (
+        FUSED_MOE_UNQUANTIZED_CONFIG,
+    )
+    from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+        TopKWeightAndReduceNoOP,
+    )
+
+    prepare = _make_prepare(manager, "standard")
+    x = torch.full((3, 1024), manager.rank + 1, device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 2]] * 3, device="cuda", dtype=torch.int64)
+    weights = torch.tensor([[0.25, 0.75]] * 3, device="cuda")
+
+    def run(output_kind, asynchronous, profile=None):
+        received, _, _, recv_ids, recv_weights = prepare.prepare(
+            x, weights, ids, 4, None, False, FUSED_MOE_UNQUANTIZED_CONFIG
+        )
+        assert recv_ids is not None and recv_weights is not None
+        fused = received * recv_weights.sum(dim=1, keepdim=True).to(received.dtype)
+        if output_kind is None:
+            output = torch.empty_like(x)
+        elif output_kind == "strided":
+            output = x.new_empty((3, 2048))[:, ::2]
+        elif output_kind == "unaligned":
+            output = x.new_empty(x.numel() + 1)[1:].view_as(x)
+        else:
+            output = fused[output_kind : output_kind + 3]
+        with profile if profile is not None else nullcontext():
+            if asynchronous:
+                receiver = prepare.finalize_async(
+                    output,
+                    fused,
+                    recv_weights,
+                    recv_ids,
+                    False,
+                    TopKWeightAndReduceNoOP(),
+                )
+                receiver()
+            else:
+                prepare.finalize(
+                    output,
+                    fused,
+                    recv_weights,
+                    recv_ids,
+                    False,
+                    TopKWeightAndReduceNoOP(),
+                )
+        return output
+
+    for output_kind in (None, 0, 1, "strided", "unaligned"):
+        for asynchronous in (False, True):
+            profile = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU]
+            )
+            output = run(output_kind, asynchronous, profile)
+            torch.testing.assert_close(output, x, rtol=0, atol=0)
+            copies = sum(
+                e.count for e in profile.key_averages() if e.key == "aten::copy_"
+            )
+            assert copies == (0 if output_kind is None else 1), (
+                "Only incompatible native output views require a copy"
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=torch.cuda.current_stream()):
+                output = run(output_kind, asynchronous)
+            for route in ([0, 2], [0, 1], [-1, -1], [0, -1]):
+                ids.copy_(torch.tensor([route] * 3, device="cuda"))
+                graph.replay()
+                expected = x * (weights * (ids >= 0)).sum(dim=1, keepdim=True).to(
+                    x.dtype
+                )
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            graph.reset()
+            del graph, output
+            ids.copy_(torch.tensor([[0, 2]] * 3, device="cuda"))
+    prepare.destroy()
+
+
+def test_standard_combine_preserves_output_views_without_unnecessary_copies(tmp_path):
+    """Real combine handles output views and skips copies for a fresh allocation."""
+    assert torch.accelerator.device_count() >= 4
+    mp.spawn(
+        _bootstrap_worker,
+        args=(f"file://{tmp_path}/combine", True, False, False, "combine_buffers"),
         nprocs=4,
         join=True,
     )
@@ -558,7 +665,7 @@ def _make_prepare(
     )
 
 
-def _check_transport_graph(manager, mode):
+def _check_transport_graph(manager, mode, cross_stream=False):
     from vllm.model_executor.layers.fused_moe.config import (
         FUSED_MOE_UNQUANTIZED_CONFIG,
         fp8_w8a8_moe_quant_config,
@@ -587,44 +694,57 @@ def _check_transport_graph(manager, mode):
         if activation_format == "standard"
         else TopKWeightAndReduceDelegate()
     )
+    expert_stream = torch.cuda.Stream() if cross_stream else None
 
     def run(x, ids, weights, asynchronous):
+        caller_stream = torch.cuda.current_stream()
+        compute_stream = expert_stream or caller_stream
         if asynchronous:
             result = prepare.prepare_async(x, weights, ids, 4, None, False, quant)
-            if isinstance(result, tuple):
-                hook, receiver = result
-                hook()
-            else:
-                receiver = result
-            received, scales, _, recv_ids, recv_weights = receiver()
         else:
             received, scales, _, recv_ids, recv_weights = prepare.prepare(
                 x, weights, ids, 4, None, False, quant
             )
-        if use_fp8:
-            assert received.dtype == torch.float8_e4m3fn and scales is not None
-            received = (received.float() * scales.repeat_interleave(128, dim=-1)).to(
-                torch.bfloat16
-            )
-        if activation_format == "standard":
-            fused = received[:, None, :].expand(-1, 2, -1).clone()
-            assert recv_ids is not None and recv_weights is not None
-        else:
-            fused = received
-            recv_ids, recv_weights = ids, weights
-        output = torch.empty_like(x)
-        if asynchronous:
-            result = prepare.finalize_async(
-                output, fused, recv_weights, recv_ids, False, reducer
-            )
-            if isinstance(result, tuple):
+        with torch.cuda.stream(compute_stream):
+            if asynchronous and isinstance(result, tuple):
                 hook, receiver = result
+                # LL's hook must order its original send stream into this consumer.
                 hook()
             else:
-                receiver = result
-            receiver()
+                if cross_stream:
+                    torch.cuda.current_stream().wait_stream(caller_stream)
+                if asynchronous:
+                    receiver = result
+            if asynchronous:
+                received, scales, _, recv_ids, recv_weights = receiver()
+            if use_fp8:
+                assert received.dtype == torch.float8_e4m3fn and scales is not None
+                received = (
+                    received.float() * scales.repeat_interleave(128, dim=-1)
+                ).to(torch.bfloat16)
+            if activation_format == "standard":
+                fused = received[:, None, :].expand(-1, 2, -1).clone()
+                assert recv_ids is not None and recv_weights is not None
+            else:
+                fused = received
+                recv_ids, recv_weights = ids, weights
+            output = torch.empty_like(x)
+            if asynchronous:
+                result = prepare.finalize_async(
+                    output, fused, recv_weights, recv_ids, False, reducer
+                )
+            else:
+                prepare.finalize(output, fused, recv_weights, recv_ids, False, reducer)
+        if asynchronous and isinstance(result, tuple):
+            hook, receiver = result
+            hook()
         else:
-            prepare.finalize(output, fused, recv_weights, recv_ids, False, reducer)
+            if cross_stream:
+                caller_stream.wait_stream(compute_stream)
+            if asynchronous:
+                receiver = result
+        if asynchronous:
+            receiver()
         return output
 
     captured = []
@@ -704,6 +824,27 @@ def test_transport_graphs_replay_changed_routing_after_eager_updates(
     mp.spawn(
         _bootstrap_worker,
         args=(f"file://{tmp_path}/graphs", True, False, False, mode),
+        nprocs=4,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("activation_format", ["standard", "batched"])
+@pytest.mark.parametrize("transport", ["bf16", "fp8"])
+def test_transport_graphs_preserve_cross_stream_handoffs(
+    tmp_path, activation_format, transport
+):
+    """Dispatch and expert/combine streams stay ordered in eager and graph modes."""
+    assert torch.accelerator.device_count() >= 4
+    mp.spawn(
+        _bootstrap_worker,
+        args=(
+            f"file://{tmp_path}/streams",
+            True,
+            False,
+            False,
+            f"streams_{activation_format}_{transport}_1024",
+        ),
         nprocs=4,
         join=True,
     )

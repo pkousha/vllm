@@ -286,6 +286,7 @@ class NcclEPBatchedPrepareAndFinalize(NcclEPPrepareAndFinalize):
             expert_map,
             apply_router_weight_on_input,
             quant_config,
+            defer_input_quant=defer_input_quant,
         )
         hook()
         return receiver()

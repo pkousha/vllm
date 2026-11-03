@@ -62,8 +62,11 @@ Each adapter reuses one native handle per microbatch slot and retains routing,
 activation, and output tensors until that slot's work completes. Completed
 activation buffers return to PyTorch through stream-aware allocator tracking;
 only eager routing stays attached to an idle handle. Captured temporaries belong
-to the PyTorch graph memory pool. Eager reuse waits on the preceding invocation's
-completion event on the GPU.
+to the PyTorch graph memory pool. Eager reuse on a different stream waits on the
+preceding invocation's completion event on the GPU; reuse on the same stream
+uses its existing ordering. Standard combine writes directly to a contiguous,
+16-byte-aligned caller output that does not share storage with the combine input.
+Other output views use a temporary followed by a copy.
 The all-to-all manager owns adapters created by the backend factory and drains
 staged communication before destroying handles, groups, and the communicator,
 in that order. Direct adapter users must call `destroy()` before destroying their
