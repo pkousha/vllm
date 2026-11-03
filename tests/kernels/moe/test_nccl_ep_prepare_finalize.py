@@ -5,6 +5,7 @@
 import gc
 import threading
 import weakref
+from contextlib import nullcontext
 from dataclasses import replace
 
 import pytest
@@ -70,7 +71,9 @@ def _bootstrap_worker(
         assert result.item() == sum(r + 1 for r in memberships[index])
         if adapter:
             _check_dispatch(manager)
-        if kernel_backend is not None and kernel_backend.startswith("dbo_"):
+        if kernel_backend is not None and kernel_backend.startswith("graph_"):
+            _check_transport_graph(manager, kernel_backend.removeprefix("graph_"))
+        elif kernel_backend is not None and kernel_backend.startswith("dbo_"):
             _check_dbo_lifetime(manager, kernel_backend.removeprefix("dbo_"))
         elif kernel_backend is not None and kernel_backend.startswith("lifetime_"):
             _check_lifetime(manager, kernel_backend.removeprefix("lifetime_"))
@@ -141,26 +144,6 @@ def _check_dispatch(manager):
         TopKWeightAndReduceContiguous,
     )
 
-    group = manager.get_handle(
-        dict(
-            algorithm="standard",
-            num_experts=4,
-            max_dispatch_tokens_per_rank=16,
-            hidden=1024,
-            dtype_bytes=2,
-        )
-    )
-    kwargs = dict(
-        ep_group=group,
-        num_dispatchers=2,
-        dp_size=1,
-        max_tokens_per_rank=16,
-        rank_expert_offset=manager.rank * 2,
-        num_experts=4,
-        num_topk=2,
-    )
-    with pytest.raises(ValueError, match="FP8 transport"):
-        NcclEPStandardPrepareAndFinalize(**kwargs, use_fp8_dispatch=True)
     prepare = _make_prepare(manager, "standard")
     assert isinstance(prepare, NcclEPStandardPrepareAndFinalize)
     cases = [
@@ -204,8 +187,10 @@ def _check_dispatch(manager):
             expected_rows += int(local.any(dim=1).sum())
             for expert in range(2):
                 expected_counts[expert] += int((source_ids == offset + expert).sum())
-        assert recv_x.shape == (expected_rows, 1024)
-        assert recv_ids.shape == recv_weights.shape == (expected_rows, 2)
+        assert recv_x.shape == (32, 1024)
+        assert recv_ids.shape == recv_weights.shape == (32, 2)
+        assert torch.count_nonzero(recv_x[expected_rows:]) == 0
+        assert torch.count_nonzero(recv_weights[expected_rows:]) == 0
         assert meta.expert_num_tokens is not None
         torch.testing.assert_close(meta.expert_num_tokens.cpu(), expected_counts)
         assert ((recv_ids >= 0) & (recv_ids < 4)).all()
@@ -246,6 +231,9 @@ def _check_experts(manager, backend):
         FUSED_MOE_UNQUANTIZED_CONFIG,
         fp8_w8a8_moe_quant_config,
     )
+    from vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (
+        BatchedDeepGemmExperts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
         DeepGemmExperts,
     )
@@ -257,6 +245,7 @@ def _check_experts(manager, backend):
     from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
         make_moe_prepare_and_finalize_no_dp_ep,
     )
+    from vllm.platforms import current_platform
     from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
     from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -267,7 +256,7 @@ def _check_experts(manager, backend):
         torch.device("cuda", torch.accelerator.current_device_index())
     )
     block_shape = list(get_mk_alignment_for_contiguous_layout())
-    quant_dtype = torch.float8_e4m3fn if backend == "deep_gemm" else None
+    quant_dtype = torch.float8_e4m3fn if "deep_gemm" in backend else None
     if quant_dtype is not None:
         from .test_deepgemm import make_block_quant_fp8_weights
 
@@ -290,24 +279,40 @@ def _check_experts(manager, backend):
         )
     else:
         full_quant = quant = FUSED_MOE_UNQUANTIZED_CONFIG
+    max_tokens = 64 if backend == "batched_deep_gemm" else 16
     group = manager.get_handle(
         dict(
-            algorithm="standard",
+            algorithm="batched" if backend == "batched_deep_gemm" else "standard",
             num_experts=4,
-            max_dispatch_tokens_per_rank=16,
+            max_dispatch_tokens_per_rank=max_tokens,
             hidden=1024,
             dtype_bytes=2,
         )
     )
-    prepare = NcclEPStandardPrepareAndFinalize(
-        group,
-        num_dispatchers=2,
-        dp_size=1,
-        max_tokens_per_rank=16,
-        rank_expert_offset=offset,
-        num_experts=4,
-        num_topk=2,
-    )
+    if backend == "batched_deep_gemm":
+        from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+            nccl_ep_batched,
+        )
+
+        prepare = nccl_ep_batched.NcclEPBatchedPrepareAndFinalize(
+            group,
+            max_tokens_per_rank=max_tokens,
+            num_dispatchers=2,
+            num_experts=4,
+            num_local_experts=2,
+            use_fp8_dispatch=True,
+        )
+    else:
+        prepare = NcclEPStandardPrepareAndFinalize(
+            group,
+            num_dispatchers=2,
+            dp_size=1,
+            max_tokens_per_rank=16,
+            rank_expert_offset=offset,
+            num_experts=4,
+            num_topk=2,
+            use_fp8_dispatch=backend == "deep_gemm_fp8",
+        )
     config = make_dummy_moe_config(
         num_experts=4,
         num_local_experts=2,
@@ -315,19 +320,52 @@ def _check_experts(manager, backend):
         hidden_dim=1024,
         intermediate_size=512,
     )
-    expert_type = DeepGemmExperts if backend == "deep_gemm" else TritonExperts
-    kernel = FusedMoEKernel(prepare, expert_type(config, quant))
-    reference = FusedMoEKernel(
-        make_moe_prepare_and_finalize_no_dp_ep(use_monolithic=False),
-        expert_type(replace(config, num_local_experts=4), full_quant),
+    expert_type = DeepGemmExperts if quant_dtype is not None else TritonExperts
+    experts = (
+        BatchedDeepGemmExperts(
+            config, quant, max_num_tokens=max_tokens, num_dispatchers=2
+        )
+        if backend == "batched_deep_gemm"
+        else expert_type(config, quant)
     )
+    kernel = FusedMoEKernel(prepare, experts)
+    if backend == "batched_deep_gemm":
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.batched import (
+            BatchedPrepareAndFinalize,
+        )
+
+        if current_platform.is_device_capability_family(100):
+            with pytest.raises(ValueError, match="per-expert capacity"):
+                BatchedDeepGemmExperts(
+                    config, quant, max_num_tokens=16, num_dispatchers=2
+                )
+        reference = FusedMoEKernel(
+            BatchedPrepareAndFinalize(128, 4, 1, 0),
+            BatchedDeepGemmExperts(
+                replace(config, num_local_experts=4),
+                full_quant,
+                max_num_tokens=128,
+                num_dispatchers=1,
+            ),
+        )
+    else:
+        reference = FusedMoEKernel(
+            make_moe_prepare_and_finalize_no_dp_ep(use_monolithic=False),
+            expert_type(replace(config, num_local_experts=4), full_quant),
+        )
     expert_map = torch.full((4,), -1, dtype=torch.int32, device="cuda")
     expert_map[offset : offset + 2] = torch.arange(2, device="cuda", dtype=torch.int32)
     torch.manual_seed(43 + manager.rank)
     x = torch.randn(3, 1024, device="cuda", dtype=torch.bfloat16) / 10
     weights = torch.tensor([[0.25, 0.75]] * 3, device="cuda")
-    for ids in ([[0, 1], [0, 2], [2, 3]], [[2, 3], [1, 3], [0, 1]]):
-        ids = torch.tensor(ids, device="cuda", dtype=torch.int64)
+    routes = (
+        [[0, 1], [0, 2], [2, 3]],
+        [[2, 3], [1, 3], [0, 1]],
+        [[0, 1]] * 3,
+        [[2, 3]] * 3,
+    )
+    for route in routes:
+        ids = torch.tensor(route, device="cuda", dtype=torch.int64)
         with set_forward_context(None, VllmConfig()):
             expected = reference.apply(
                 x, w1, w2, weights, ids, MoEActivation.SILU, 4, None, False
@@ -346,11 +384,35 @@ def _check_experts(manager, backend):
         torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
         torch.accelerator.synchronize()
 
+    graph = torch.cuda.CUDAGraph()
+    with set_forward_context(None, VllmConfig()), torch.cuda.graph(graph):
+        actual = kernel.apply(
+            hidden_states=x,
+            w1=w1[offset : offset + 2],
+            w2=w2[offset : offset + 2],
+            topk_weights=weights,
+            topk_ids=ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=4,
+            expert_map=expert_map,
+            apply_router_weight_on_input=False,
+        )
+    for route in routes:
+        ids.copy_(torch.tensor(route, device="cuda", dtype=torch.int64))
+        with set_forward_context(None, VllmConfig()):
+            expected = reference.apply(
+                x, w1, w2, weights, ids, MoEActivation.SILU, 4, None, False
+            )
+        graph.replay()
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
+    del graph
     prepare.destroy()
 
 
-@pytest.mark.parametrize("backend", ["triton", "deep_gemm"])
-def test_standard_expert_kernels_consume_dispatch_metadata(tmp_path, backend):
+@pytest.mark.parametrize(
+    "backend", ["triton", "deep_gemm", "deep_gemm_fp8", "batched_deep_gemm"]
+)
+def test_expert_kernels_consume_dispatch_metadata(tmp_path, backend):
     """Real expert computation must agree with a replicated reference."""
     assert torch.accelerator.device_count() >= 4
     mp.spawn(
@@ -449,7 +511,9 @@ def test_batched_counts_padding_and_invalid_remapping(tmp_path):
     )
 
 
-def _make_prepare(manager, activation_format, routing_tables=None):
+def _make_prepare(
+    manager, activation_format, routing_tables=None, quant_config=None, hidden=1024
+):
     from vllm.model_executor.layers.fused_moe.all2all_utils import (
         maybe_make_prepare_finalize,
     )
@@ -480,7 +544,7 @@ def _make_prepare(manager, activation_format, routing_tables=None):
             num_experts=4,
             num_local_experts=2,
             experts_per_token=2,
-            hidden_dim=1024,
+            hidden_dim=hidden,
             intermediate_size=512,
             max_num_tokens=16,
         ),
@@ -488,9 +552,160 @@ def _make_prepare(manager, activation_format, routing_tables=None):
     )
     return maybe_make_prepare_finalize(
         config,
-        FUSED_MOE_UNQUANTIZED_CONFIG,
+        quant_config if quant_config is not None else FUSED_MOE_UNQUANTIZED_CONFIG,
         all2all_manager=manager,
         routing_tables=routing_tables,
+    )
+
+
+def _check_transport_graph(manager, mode):
+    from vllm.model_executor.layers.fused_moe.config import (
+        FUSED_MOE_UNQUANTIZED_CONFIG,
+        fp8_w8a8_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+        TopKWeightAndReduceContiguous,
+        TopKWeightAndReduceDelegate,
+    )
+    from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+
+    activation_format, transport, hidden_text = mode.split("_")
+    hidden = int(hidden_text)
+    use_fp8 = transport == "fp8"
+    quant = FUSED_MOE_UNQUANTIZED_CONFIG
+    if use_fp8:
+        quant = fp8_w8a8_moe_quant_config(
+            torch.ones((2, 8, hidden // 128), device="cuda"),
+            torch.ones((2, hidden // 128, 4), device="cuda"),
+            block_shape=[128, 128],
+        )
+    prepare = _make_prepare(
+        manager, activation_format, quant_config=quant, hidden=hidden
+    )
+    reducer = (
+        TopKWeightAndReduceContiguous()
+        if activation_format == "standard"
+        else TopKWeightAndReduceDelegate()
+    )
+
+    def run(x, ids, weights, asynchronous):
+        if asynchronous:
+            result = prepare.prepare_async(x, weights, ids, 4, None, False, quant)
+            if isinstance(result, tuple):
+                hook, receiver = result
+                hook()
+            else:
+                receiver = result
+            received, scales, _, recv_ids, recv_weights = receiver()
+        else:
+            received, scales, _, recv_ids, recv_weights = prepare.prepare(
+                x, weights, ids, 4, None, False, quant
+            )
+        if use_fp8:
+            assert received.dtype == torch.float8_e4m3fn and scales is not None
+            received = (received.float() * scales.repeat_interleave(128, dim=-1)).to(
+                torch.bfloat16
+            )
+        if activation_format == "standard":
+            fused = received[:, None, :].expand(-1, 2, -1).clone()
+            assert recv_ids is not None and recv_weights is not None
+        else:
+            fused = received
+            recv_ids, recv_weights = ids, weights
+        output = torch.empty_like(x)
+        if asynchronous:
+            result = prepare.finalize_async(
+                output, fused, recv_weights, recv_ids, False, reducer
+            )
+            if isinstance(result, tuple):
+                hook, receiver = result
+                hook()
+            else:
+                receiver = result
+            receiver()
+        else:
+            prepare.finalize(output, fused, recv_weights, recv_ids, False, reducer)
+        return output
+
+    captured = []
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    for count in (2, 3):
+        x = torch.ones((count, hidden), device="cuda", dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 2]] * count, device="cuda", dtype=torch.int64)
+        weights = torch.tensor([[0.25, 0.75]] * count, device="cuda")
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run(x, ids, weights, count == 3)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = run(x, ids, weights, count == 3)
+        captured.append((graph, x, ids, weights, output))
+
+    # Later eager handle updates must not invalidate either captured graph.
+    for count in (0, 1):
+        x = torch.ones((count, hidden), device="cuda", dtype=torch.bfloat16)
+        ids = torch.tensor([[1, 3]] * count, device="cuda", dtype=torch.int64).reshape(
+            count, 2
+        )
+        weights = torch.full((count, 2), 0.5, device="cuda")
+        torch.testing.assert_close(run(x, ids, weights, True), x, rtol=0, atol=0)
+    torch.accelerator.synchronize()
+    routes = ([0, 1], [2, 3], [0, 2], [-1, -1], [0, -1])
+    for iteration in range(10):
+        graph, x, ids, weights, output = captured[iteration % 2]
+        ids.copy_(torch.tensor([routes[iteration // 2]] * x.shape[0], device="cuda"))
+        x.fill_(1 + manager.rank + iteration)
+        graph.replay()
+        expected = x
+        if use_fp8:
+            q, scales = moe_kernel_quantize_input(
+                x, None, quant.quant_dtype, False, quant.block_shape
+            )
+            assert scales is not None
+            expected = (q.float() * scales.repeat_interleave(128, dim=-1)).to(x.dtype)
+        expected = expected * (weights * (ids >= 0)).sum(dim=1, keepdim=True).to(
+            x.dtype
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    del graph, output, captured
+    torch.accelerator.synchronize()
+    memory_samples = []
+    for _ in range(6):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = run(x, ids.clone(), weights, True)
+        graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        graph.reset()
+        del graph, output
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        memory_samples.append(
+            (torch.accelerator.memory_allocated(), torch.accelerator.memory_reserved())
+        )
+    assert len(set(memory_samples[2:])) == 1, "graph pools remain pinned after reset"
+    manager.destroy()
+
+
+@pytest.mark.parametrize("transport", ["bf16", "fp8"])
+@pytest.mark.parametrize(
+    "activation_format,hidden",
+    [("standard", 128), ("standard", 1024), ("batched", 512), ("batched", 1024)],
+)
+def test_transport_graphs_replay_changed_routing_after_eager_updates(
+    tmp_path, activation_format, transport, hidden
+):
+    """Two graphs keep independent inputs and replay changing/empty routes."""
+    assert torch.accelerator.device_count() >= 4
+    mode = f"graph_{activation_format}_{transport}_{hidden}"
+    mp.spawn(
+        _bootstrap_worker,
+        args=(f"file://{tmp_path}/graphs", True, False, False, mode),
+        nprocs=4,
+        join=True,
     )
 
 
@@ -617,10 +832,12 @@ def test_native_handle_reuse_retains_routing_and_stabilizes_memory(
     )
 
 
-def _check_dbo_lifetime(manager, activation_format):
+def _check_dbo_lifetime(manager, mode):
+    activation_format, transport = mode.split("_")
     from vllm.forward_context import create_forward_context
     from vllm.model_executor.layers.fused_moe.config import (
         FUSED_MOE_UNQUANTIZED_CONFIG,
+        fp8_w8a8_moe_quant_config,
     )
     from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
         TopKWeightAndReduceContiguous,
@@ -633,37 +850,51 @@ def _check_dbo_lifetime(manager, activation_format):
         make_ubatch_contexts,
     )
 
-    prepare = _make_prepare(manager, activation_format)
+    quant = FUSED_MOE_UNQUANTIZED_CONFIG
+    if transport == "fp8":
+        quant = fp8_w8a8_moe_quant_config(
+            torch.ones((2, 8, 8), device="cuda"),
+            torch.ones((2, 8, 4), device="cuda"),
+            block_shape=[128, 128],
+        )
+    prepare = _make_prepare(manager, activation_format, quant_config=quant)
+    inputs = [
+        (
+            torch.ones((slot + 1, 1024), device="cuda", dtype=torch.bfloat16),
+            torch.tensor([[0, 2]] * (slot + 1), device="cuda", dtype=torch.int64),
+            torch.full((slot + 1, 2), 0.5, device="cuda"),
+        )
+        for slot in range(2)
+    ]
+    outputs: list[torch.Tensor | None] = [None, None]
+    compute_stream = torch.cuda.Stream()
+    compute_stream.wait_stream(torch.cuda.current_stream())
     device = torch.accelerator.current_device_index()
     barrier = threading.Barrier(3)
     contexts = make_ubatch_contexts(
-        2,
-        torch.cuda.current_stream(),
-        torch.cuda.Stream(),
-        [create_forward_context(None, VllmConfig()) for _ in range(2)],
-        barrier,
+        num_micro_batches=2,
+        compute_stream=compute_stream,
+        comm_stream=torch.cuda.Stream(),
+        forward_contexts=[create_forward_context(None, VllmConfig()) for _ in range(2)],
+        ready_barrier=barrier,
     )
     pointers: list[set[int]] = [set(), set()]
     errors: list[BaseException] = []
 
-    def run(context):
+    def run(context, capturing):
         try:
             torch.accelerator.set_device_index(device)
+            for stream in (context.compute_stream, context.comm_stream):
+                with torch.cuda.stream(stream):
+                    _ = torch.cuda.current_blas_handle()
             with context:
-                for iteration in range(8):
+                for iteration in range(1 if capturing else 8):
                     dbo_maybe_run_recv_hook()
-                    x = torch.full(
-                        (context.id + 1, 1024),
-                        1 + manager.rank + context.id * 4 + iteration * 8,
-                        device="cuda",
-                        dtype=torch.bfloat16,
-                    )
-                    ids = torch.tensor(
-                        [[0, 2]] * x.shape[0], device="cuda", dtype=torch.int64
-                    )
-                    weights = torch.full((x.shape[0], 2), 0.5, device="cuda")
+                    x, ids, weights = inputs[context.id]
+                    if not capturing:
+                        x.fill_(1 + manager.rank + context.id * 4 + iteration)
                     result = prepare.prepare_async(
-                        x, weights, ids, 4, None, False, FUSED_MOE_UNQUANTIZED_CONFIG
+                        x, weights, ids, 4, None, False, quant
                     )
                     if isinstance(result, tuple):
                         hook, receiver = result
@@ -671,7 +902,12 @@ def _check_dbo_lifetime(manager, activation_format):
                         dbo_yield()
                     else:
                         receiver = result
-                    received, _, _, recv_ids, recv_weights = receiver()
+                    received, scales, _, recv_ids, recv_weights = receiver()
+                    if transport == "fp8":
+                        assert scales is not None
+                        received = (
+                            received.float() * scales.repeat_interleave(128, dim=-1)
+                        ).to(torch.bfloat16)
                     pointers[context.id].add(prepare.handles[context.id].ptr)
                     if activation_format == "standard":
                         fused = received[:, None, :].expand(-1, 2, -1).clone()
@@ -691,7 +927,9 @@ def _check_dbo_lifetime(manager, activation_format):
                     else:
                         receiver = result
                     receiver()
-                    torch.testing.assert_close(output, x, rtol=0, atol=0)
+                    outputs[context.id] = output
+                    if not capturing:
+                        torch.testing.assert_close(output, x, rtol=0, atol=0)
                     dbo_maybe_run_recv_hook()
                     dbo_yield()
         except BaseException as error:
@@ -699,16 +937,41 @@ def _check_dbo_lifetime(manager, activation_format):
             for context in contexts:
                 context.cpu_wait_event.set()
 
-    threads = [threading.Thread(target=run, args=(c,), daemon=True) for c in contexts]
-    for thread in threads:
-        thread.start()
-    barrier.wait(timeout=30)
-    contexts[0].cpu_wait_event.set()
-    for thread in threads:
-        thread.join(timeout=120)
-        assert not thread.is_alive(), "microbatch scheduling did not finish"
-    if errors:
-        raise errors[0]
+    graph = torch.cuda.CUDAGraph()
+    for capturing in (False, True):
+        for context in contexts:
+            context.cpu_wait_event.clear()
+        threads = [
+            threading.Thread(target=run, args=(c, capturing), daemon=True)
+            for c in contexts
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=30)
+        with (
+            torch.cuda.graph(graph, stream=compute_stream)
+            if capturing
+            else nullcontext()
+        ):
+            contexts[0].cpu_wait_event.set()
+            for thread in threads:
+                thread.join(timeout=120)
+                assert not thread.is_alive(), "microbatch scheduling did not finish"
+        if errors:
+            raise errors[0]
+        torch.accelerator.synchronize()
+    routes = ([0, 1], [2, 3], [0, 2], [-1, -1], [0, -1])
+    for iteration in range(10):
+        for slot, (x, ids, weights) in enumerate(inputs):
+            x.fill_(1 + manager.rank + iteration + slot * 2)
+            ids.copy_(
+                torch.tensor([routes[iteration // 2]] * x.shape[0], device="cuda")
+            )
+        graph.replay()
+        for (x, ids, weights), output in zip(inputs, outputs):
+            expected = x * (weights * (ids >= 0)).sum(dim=1, keepdim=True).to(x.dtype)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    graph.reset()
     assert all(len(slot) == 1 for slot in pointers)
     assert pointers[0].isdisjoint(pointers[1])
     handles = list(prepare.handles)
@@ -719,8 +982,9 @@ def _check_dbo_lifetime(manager, activation_format):
 
 
 @pytest.mark.parametrize("activation_format", ["standard", "batched"])
-def test_native_handle_lifetime_isolated_between_microbatch_slots(
-    tmp_path, activation_format
+@pytest.mark.parametrize("transport", ["bf16", "fp8"])
+def test_native_handles_replay_changed_routes_in_both_microbatch_slots(
+    tmp_path, activation_format, transport
 ):
     assert torch.accelerator.device_count() >= 4
     mp.spawn(
@@ -730,7 +994,7 @@ def test_native_handle_lifetime_isolated_between_microbatch_slots(
             True,
             False,
             False,
-            "dbo_" + activation_format,
+            f"dbo_{activation_format}_{transport}",
         ),
         nprocs=4,
         join=True,

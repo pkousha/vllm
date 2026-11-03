@@ -43,6 +43,7 @@ from vllm.utils.import_utils import (
     has_nccl_ep,
     has_nixl_ep,
 )
+from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
     from flashinfer.fused_moe import QuantFormat
@@ -323,7 +324,21 @@ def maybe_make_prepare_finalize(
 
     elif moe.use_nccl_ep_kernels:
         if moe.in_dtype != torch.bfloat16:
-            raise ValueError("NCCL EP currently requires BF16 transport inputs.")
+            raise ValueError(
+                "NCCL EP expects BF16 inputs before transport quantization."
+            )
+        use_fp8_dispatch = (
+            quant_config is not None
+            and quant_config.quant_dtype == torch.float8_e4m3fn
+            and quant_config.is_block_quantized
+        )
+        max_token_bytes = moe.hidden_dim * moe.in_dtype.itemsize
+        if use_fp8_dispatch:
+            assert quant_config is not None and quant_config.block_shape is not None
+            scale_bytes = round_up(
+                (moe.hidden_dim // quant_config.block_shape[1]) * 4, 16
+            )
+            max_token_bytes = max(max_token_bytes, moe.hidden_dim + scale_bytes)
         if moe.moe_parallel_config.use_batched_activation_format:
             assert quant_config is not None
             global_to_physical = physical_to_global = local_expert_global_ids = None
@@ -340,6 +355,7 @@ def maybe_make_prepare_finalize(
                 max_dispatch_tokens_per_rank=moe.max_num_tokens,
                 hidden=moe.hidden_dim,
                 dtype_bytes=moe.in_dtype.itemsize,
+                max_token_bytes=max_token_bytes,
             )
             handle = all2all_manager.get_handle(all_to_all_args)
 
@@ -349,7 +365,7 @@ def maybe_make_prepare_finalize(
                 num_dispatchers=all2all_manager.world_size,
                 num_experts=moe.num_experts,
                 num_local_experts=num_local_experts,
-                use_fp8_dispatch=False,
+                use_fp8_dispatch=use_fp8_dispatch,
                 global_to_physical=global_to_physical,
                 physical_to_global=physical_to_global,
                 local_expert_global_ids=local_expert_global_ids,
@@ -362,6 +378,7 @@ def maybe_make_prepare_finalize(
                 max_dispatch_tokens_per_rank=moe.max_num_tokens,
                 hidden=moe.hidden_dim,
                 dtype_bytes=moe.in_dtype.itemsize,
+                max_token_bytes=max_token_bytes,
             )
             handle = all2all_manager.get_handle(all_to_all_args)
 
@@ -373,7 +390,7 @@ def maybe_make_prepare_finalize(
                 rank_expert_offset=all2all_manager.rank * moe.num_local_experts,
                 num_experts=moe.num_experts,
                 num_topk=moe.experts_per_token,
-                use_fp8_dispatch=False,
+                use_fp8_dispatch=use_fp8_dispatch,
             )
 
         all2all_manager.register_prepare_finalize(prepare_finalize)

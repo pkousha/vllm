@@ -307,8 +307,8 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         max_num_tokens: int,
         num_dispatchers: int,
     ):
-        """max_num_tokens: Maximum number of tokens from a DP Rank
-        num_dispatchers: The number of DP dispatchers.
+        """max_num_tokens: Maximum number of tokens from one dispatcher.
+        num_dispatchers: Number of senders contributing to each expert's capacity.
         quant_config: Quantization configuration
         """
         super().__init__(
@@ -319,6 +319,16 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         )
         assert self.block_shape == get_mk_alignment_for_contiguous_layout()
         assert self.quant_config.use_fp8_w8a8
+        # SM100 masked GEMM stores whole M tiles across expert boundaries.
+        if (
+            current_platform.is_device_capability_family(100)
+            and (max_num_tokens * num_dispatchers) % self.block_shape[0]
+        ):
+            raise ValueError(
+                "Batched DeepGEMM on SM100 requires per-expert capacity "
+                "(max_num_tokens * num_dispatchers) divisible by "
+                f"its M alignment ({self.block_shape[0]})."
+            )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:

@@ -20,37 +20,57 @@ Before using EP, you need to install the necessary dependencies. We are actively
 ### Direct NCCL-EP (experimental)
 
 The direct `nccl_ep` backend uses separate `nccl4py` communicator bindings and
-`nccl-extensions` EP bindings. For the CUDA 13 BF16 baseline, install the pinned
+`nccl-extensions` EP bindings. For CUDA 13, install the pinned
 optional dependencies with `uv pip install -r requirements/nccl_ep.txt`:
 NCCL 2.30.7, nccl4py 0.5.0, and nccl-extensions 0.1.0 (EP native API 2).
 Check `nccl.core.get_version()` for the **loaded** NCCL library; package metadata
 and PyTorch's compiled NCCL version alone do not identify it.
 
-Select `--all2all-backend nccl_ep --enforce-eager` and
+Select `--all2all-backend nccl_ep` and
 `--nccl-ep-activation-format standard` (HT/FLAT) or `batched` (LL/EXPERT_MAJOR).
-Transport is BF16; quantized expert kernels quantize locally after dispatch.
-FP8 transport is rejected until its quantization recipe is implemented.
+Block-FP8 expert configurations dispatch FP8 activations and FP32 block scales
+using NCCL-EP's [`FWD` quantization recipe](https://github.com/NVIDIA/nccl-extensions/blob/e57f0dad43dc1ca5bf96f09bf4075afc2eae6599/nccl_ep/docs/documentation/quantization.md).
+Physical scale rows are padded to
+16-byte alignment, then trimmed for expert computation. The native token-byte
+budget covers both activation and scale bytes, and BF16 combine outputs.
+BF16 transport remains available for other expert configurations and deferred
+input quantization. Combine returns BF16 tokens.
+The pinned LL combine kernel requires hidden dimensions divisible by 512.
+Batched DeepGEMM on SM100 also requires per-expert capacity (maximum sender
+tokens times EP size) divisible by its M alignment, 128 in the tested
+environment. Invalid capacity configurations are rejected before GPU execution.
+This concerns the allocated capacity; actual token counts can vary, including zero.
 NCCL-EP requires a positive expert count divisible by EP size. EP and DP sizes
 can differ, and EP subgroups can exclude global rank zero or use noncontiguous
 membership. Standard receive capacity is the configured maximum sender token
-count multiplied by EP size; only the native receive count reaches the experts.
+count multiplied by EP size. Standard returns fixed-capacity tensors and masks
+unused rows on the GPU using the native receive count. Padding activations are
+zero and carry no valid expert assignments or nonzero routing weights.
 Native expert counters include all valid local top-k assignments. Received IDs
 are explicitly local at the NCCL boundary, then valid IDs are offset to vLLM's
 global expert IDs. With multiple EP ranks, invalid slots use a nonlocal global
 ID that the expert map filters out, with zero routing weight; single-rank EP
 retains `-1` for invalid slots.
-The initial correctness baseline is eager-only. CUDA graph capture is rejected.
+Expert counts stay on the GPU; DeepGEMM uses its bound-based workspace sizing.
+Both layouts support CUDA graph capture after eager warmup of each used
+microbatch slot. Routing data can change between replays; input shapes are fixed
+for each graph. Keep static graph inputs alive and order graph replay and eager
+calls sharing an adapter using the usual CUDA stream dependencies. Complete
+eager warmup before beginning capture; eager completion events cannot be waited
+on from within a different stream's capture.
 Each adapter reuses one native handle per microbatch slot and retains routing,
 activation, and output tensors until that slot's work completes. Completed
 activation buffers return to PyTorch through stream-aware allocator tracking;
-only the routing tensor stays attached to an idle handle. New work waits on
-the preceding invocation's completion event on the GPU.
+only eager routing stays attached to an idle handle. Captured temporaries belong
+to the PyTorch graph memory pool. Eager reuse waits on the preceding invocation's
+completion event on the GPU.
 The all-to-all manager owns adapters created by the backend factory and drains
 staged communication before destroying handles, groups, and the communicator,
 in that order. Direct adapter users must call `destroy()` before destroying their
-group. Teardown is idempotent; using a destroyed adapter is rejected.
-CUDA graph resource lifetime, full DBO scheduling, and multi-node validation are
-still required before production use.
+group. Teardown is idempotent; using a destroyed adapter is rejected. Finish all
+replays before teardown and never replay a graph after its manager is destroyed.
+End-to-end model inference, including full-model graphs and DBO, and multi-node
+operation have not been validated.
 
 ### Backend Selection Guide
 

@@ -47,8 +47,38 @@ def _get_cuda_stream():
     return torch.cuda.current_stream().cuda_stream
 
 
+def _quantize_dispatch_input(tokens, quant_config):
+    if (
+        quant_config.quant_dtype != torch.float8_e4m3fn
+        or not quant_config.is_block_quantized
+    ):
+        raise ValueError("NCCL EP FP8 transport requires block-FP8 expert inputs.")
+    assert quant_config.block_shape is not None
+    if tokens.shape[1] % quant_config.block_shape[1] or tokens.shape[1] % 16:
+        raise ValueError(
+            "NCCL EP FP8 rows must align to the quantization block and 16B."
+        )
+    num_scales = tokens.shape[1] // quant_config.block_shape[1]
+    if tokens.shape[0] == 0:
+        tokens = torch.empty_like(tokens, dtype=torch.float8_e4m3fn)
+        scales = torch.empty((0, num_scales), dtype=torch.float32, device=tokens.device)
+    else:
+        tokens, scales = moe_kernel_quantize_input(
+            tokens,
+            quant_config.a1_scale,
+            quant_config.quant_dtype,
+            quant_config.per_act_token_quant,
+            quant_config.block_shape,
+        )
+        assert scales is not None
+    # FWD requires a 16-byte physical scale row, including for small hidden sizes.
+    if num_scales % 4:
+        scales = torch.nn.functional.pad(scales, (0, -num_scales % 4))
+    return tokens, scales.contiguous()
+
+
 class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
-    """Own eager-only native handles and their pointer-backed tensors."""
+    """Own native handles and their pointer-backed tensors."""
 
     def __init__(self, ep_group: nccl_ep.Group):
         super().__init__()
@@ -60,6 +90,7 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self._pending: list[torch.cuda.Stream | None] = [None, None]
         self._active = [False, False]
         self._num_topk: int | None = None
+        self._devices: set[torch.device] = set()
         self._destroyed = False
 
     def _check_not_destroyed(self):
@@ -72,15 +103,22 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             raise RuntimeError("NCCL EP microbatch still has an unfinished invocation.")
         if self._num_topk is not None and routing.shape[1] != self._num_topk:
             raise ValueError("NCCL EP handle reuse requires a constant top-k.")
+        handle = self.handles[index]
+        capturing = torch.cuda.is_current_stream_capturing()
+        if handle is None and capturing:
+            raise RuntimeError("Warm up NCCL EP before CUDA graph capture.")
         done = self._done[index]
-        if done is not None:
+        if capturing:
+            # Capture/replay must be ordered by the caller after eager work.
+            self._done[index] = None
+        elif done is not None:
             # PERF_REVIEW(pkousha): This GPU wait may be redundant; verify whether
             # existing stream handoffs already order reuse across streams.
             torch.cuda.current_stream().wait_event(done)
         self._tensors[index] = [routing, *tensors]
+        self._devices.add(routing.device)
         self._active[index] = True
         stream = _get_cuda_stream()
-        handle = self.handles[index]
         if handle is None:
             handle = self.ep_group.create_handle(
                 layout,
@@ -119,14 +157,21 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         previous = self._done[index]
         if previous is not None:
             stream.wait_event(previous)
+        # PERF_REVIEW(pkousha): Check which allocator stream records are necessary;
+        # prove ownership under allocator pressure before removing them.
         for tensor in self._tensors[index]:
             tensor.record_stream(stream)
-        # Only routing remains cached by the idle native handle.
-        self._tensors[index] = self._tensors[index][:1]
         self._descriptors[index].clear()
-        done = torch.cuda.Event()
-        done.record(stream)
-        self._done[index] = done
+        if torch.cuda.is_current_stream_capturing():
+            # Graph pools own temporaries; callers own static inputs across replay.
+            self._tensors[index].clear()
+            self._done[index] = None
+        else:
+            # Only routing remains cached by the idle native handle.
+            self._tensors[index] = self._tensors[index][:1]
+            done = torch.cuda.Event()
+            done.record(stream)
+            self._done[index] = done
         self._active[index] = False
 
     def destroy(self):
@@ -134,8 +179,7 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             return
         for index in range(len(self.handles)):
             self._complete(index)
-        devices = {tensor.device for tensors in self._tensors for tensor in tensors}
-        for device in devices:
+        for device in self._devices:
             torch.accelerator.synchronize(device)
         for index, handle in enumerate(self.handles):
             if handle is not None:
@@ -145,6 +189,7 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             self._descriptors[index].clear()
             self._done[index] = None
             self._active[index] = False
+        self._devices.clear()
         self._destroyed = True
 
 
@@ -171,8 +216,7 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
         self.rank_expert_offset = rank_expert_offset
         self.num_experts = num_experts
         self.num_topk = num_topk
-        if use_fp8_dispatch:
-            raise ValueError("NCCL EP FP8 transport is not supported yet; use BF16.")
+        self.use_fp8_dispatch = use_fp8_dispatch
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -193,14 +237,13 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
     def _do_dispatch(
         self,
         tokens: torch.Tensor,
+        token_scales: torch.Tensor | None,
         rank_topk_ids: torch.Tensor,
         rank_topk_weights: torch.Tensor,
         a1_scale: torch.Tensor | None,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
     ) -> Callable:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("NCCL EP CUDA graph capture is not supported yet.")
         num_tokens = tokens.shape[0]
         assert num_tokens <= self.max_tokens_per_rank
         hidden = tokens.shape[1]
@@ -227,6 +270,8 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
             (tokens, rank_topk_weights, recv_total, expert_counts),
             layout_info=layout_info,
         )
+        if token_scales is not None:
+            self._tensors[a2a_idx].append(token_scales)
 
         # FLAT sends each token at most once to each EP rank, irrespective of DP.
         max_recv = nccl_ep_max_recv_tokens(
@@ -247,21 +292,39 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
             dtype=torch.int64,
             device=tokens.device,
         )
+        recv_scales = None
+        if token_scales is not None:
+            recv_scales = torch.empty(
+                (max_recv, token_scales.shape[1]),
+                dtype=token_scales.dtype,
+                device=tokens.device,
+            )
+            self._tensors[a2a_idx].append(recv_scales)
         self._tensors[a2a_idx].extend((recv_tokens, recv_topk_weights, recv_topk_idx))
         dispatch_inputs = nccl_ep.DispatchInputs(
             tokens=_to_nccl_tensor(tokens),
             topk_weights=_to_nccl_tensor(rank_topk_weights),
+            scales=_to_nccl_tensor(token_scales) if token_scales is not None else None,
         )
         dispatch_outputs = nccl_ep.DispatchOutputs(
             tokens=_to_nccl_tensor(recv_tokens),
             topk_weights=_to_nccl_tensor(recv_topk_weights),
             topk_idx=_to_nccl_tensor(recv_topk_idx),
+            scales=_to_nccl_tensor(recv_scales) if recv_scales is not None else None,
         )
 
+        # PERF_REVIEW(pkousha): Pinned HT eager dispatch reads a count on CPU;
+        # captured fixed-buffer dispatch skips that native synchronization.
         ep_handle.dispatch(
             dispatch_inputs,
             dispatch_outputs,
-            config=nccl_ep.DispatchConfig(send_only=0),
+            config=nccl_ep.DispatchConfig(
+                quantization_recipe=(
+                    nccl_ep.DispatchQuantizationRecipe.FWD
+                    if token_scales is not None
+                    else nccl_ep.DispatchQuantizationRecipe.NONE
+                ),
+            ),
             stream=stream,
         )
         ep_handle.complete(stream=stream)
@@ -270,6 +333,7 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
 
         return lambda: self._receiver(
             recv_tokens,
+            recv_scales,
             recv_topk_idx,
             recv_topk_weights,
             recv_total,
@@ -282,6 +346,7 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
     def _receiver(
         self,
         recv_x: torch.Tensor,
+        recv_scales: torch.Tensor | None,
         recv_topk_idx: torch.Tensor | None,
         recv_topk_weights: torch.Tensor | None,
         recv_total: torch.Tensor,
@@ -290,20 +355,31 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
     ) -> mk.PrepareResultType:
-        num_recv = int(recv_total.item())
-        if not 0 <= num_recv <= recv_x.shape[0]:
-            raise RuntimeError(
-                f"NCCL EP received {num_recv} rows for capacity {recv_x.shape[0]}"
-            )
-        expert_x = recv_x[:num_recv]
+        torch._assert_async(
+            (recv_total >= 0) & (recv_total <= recv_x.shape[0]),
+            "NCCL EP receive count exceeds the buffer capacity",
+        )
+        valid_rows = (torch.arange(recv_x.shape[0], device=recv_x.device) < recv_total)[
+            :, None
+        ]
+        # PERF_REVIEW(pkousha): Masking and local quantization visit full capacity;
+        # investigate smaller per-graph bounds without dropping the padding mask.
+        # Byte views also support FP8, whose masked_fill is not implemented.
+        expert_x = (
+            recv_x.view(torch.uint8).masked_fill(~valid_rows, 0).view(recv_x.dtype)
+        )
         expert_x_scale = None
-        if recv_topk_idx is not None:
-            recv_topk_idx = recv_topk_idx[:num_recv]
-        if recv_topk_weights is not None:
-            recv_topk_weights = recv_topk_weights[:num_recv]
+        if recv_scales is not None:
+            assert quant_config.block_shape is not None
+            num_scales = recv_x.shape[1] // quant_config.block_shape[1]
+            expert_x_scale = recv_scales[:, :num_scales].masked_fill(~valid_rows, 1.0)
 
         if recv_topk_idx is not None:
-            valid = (recv_topk_idx >= 0) & (recv_topk_idx < expert_counts.numel())
+            valid = (
+                valid_rows
+                & (recv_topk_idx >= 0)
+                & (recv_topk_idx < expert_counts.numel())
+            )
             # Match DeepEP HT: expert_map filters a valid nonlocal global ID.
             invalid_id = -1
             if self.num_dispatchers_ > 1:
@@ -316,10 +392,12 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_counts,
-            expert_num_tokens_cpu=expert_counts.cpu(),
+            # PERF_REVIEW(pkousha): GPU-only counts permit capture; measure
+            # DeepGEMM's larger workspace bound against exact CPU sizing.
+            expert_num_tokens_cpu=None,
         )
 
-        if not defer_input_quant and expert_x.numel() != 0:
+        if expert_x_scale is None and not defer_input_quant and expert_x.numel() != 0:
             expert_x, expert_x_scale = moe_kernel_quantize_input(
                 expert_x,
                 a1_scale,
@@ -359,15 +437,21 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
             a1 = a1 * topk_weights.to(a1.dtype)
 
         if a1.dtype != torch.bfloat16:
-            raise ValueError("NCCL EP currently requires BF16 transport inputs.")
+            raise ValueError(
+                "NCCL EP expects BF16 inputs before transport quantization."
+            )
         a1_post_scale = (
             quant_config.a1_gscale
             if quant_config.quant_dtype == "nvfp4"
             else quant_config.a1_scale
         )
+        token_scales = None
+        if self.use_fp8_dispatch and not defer_input_quant:
+            a1, token_scales = _quantize_dispatch_input(a1, quant_config)
 
         return self._do_dispatch(
             tokens=a1,
+            token_scales=token_scales,
             rank_topk_ids=topk_ids,
             rank_topk_weights=topk_weights,
             a1_scale=a1_post_scale,
@@ -409,8 +493,6 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
         do_async: bool,
     ) -> Callable | None:
         self._check_not_destroyed()
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("NCCL EP CUDA graph capture is not supported yet.")
         a2a_idx = dbo_current_ubatch_id()
         ep_handle = self.handles[a2a_idx]
         assert ep_handle is not None

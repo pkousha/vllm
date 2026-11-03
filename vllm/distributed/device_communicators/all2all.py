@@ -1505,7 +1505,7 @@ class NcclEPAll2AllManager(All2AllManagerBase):
             )
         hidden = kwargs["hidden"]
         dtype_bytes = kwargs.get("dtype_bytes", 2)  # bf16 default
-        max_token_bytes = hidden * dtype_bytes
+        max_token_bytes = kwargs.get("max_token_bytes", hidden * dtype_bytes)
 
         ep_group = self._get_or_create_group(
             algorithm=algorithm,
