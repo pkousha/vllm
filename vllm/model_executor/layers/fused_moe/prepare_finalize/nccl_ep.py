@@ -15,7 +15,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-from vllm.utils.torch_utils import aux_stream
+from vllm.utils.torch_utils import aux_stream, current_stream
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
@@ -101,7 +101,9 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if self._destroyed:
             raise RuntimeError("NCCL EP prepare/finalize has been destroyed.")
 
-    def _get_handle(self, index, layout, routing, tensors, layout_info=None):
+    def _get_handle(
+        self, index, layout, routing, tensors, layout_info=None, ordered_stream=None
+    ):
         self._check_not_destroyed()
         if self._active[index]:
             raise RuntimeError("NCCL EP microbatch still has an unfinished invocation.")
@@ -117,9 +119,9 @@ class NcclEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if not capturing and done is not None:
             event, producer = done
             consumer = torch.cuda.current_stream(routing.device)
-            if consumer != producer:
-                # PERF_REVIEW(pkousha): DBO may already order this reuse;
-                # other cross-stream callers still need the dependency.
+            if consumer != producer and producer != ordered_stream:
+                # PERF_REVIEW(pkousha): Cross-stream reuse needs ordering;
+                # a matching DBO compute handoff already supplies it.
                 consumer.wait_event(event)
         self._tensors[index] = [routing, *tensors]
         self._devices.add(routing.device)
@@ -253,6 +255,7 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
         assert num_tokens <= self.max_tokens_per_rank
         hidden = tokens.shape[1]
         topk = rank_topk_ids.shape[1]
+        compute_stream = current_stream() if dbo_enabled() else None
         dbo_yield_and_switch_from_compute_to_comm()
         stream = _get_cuda_stream()
 
@@ -274,6 +277,7 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
             rank_topk_ids,
             (tokens, rank_topk_weights, recv_total, expert_counts),
             layout_info=layout_info,
+            ordered_stream=compute_stream,
         )
         if token_scales is not None:
             self._tensors[a2a_idx].append(token_scales)
@@ -367,12 +371,11 @@ class NcclEPStandardPrepareAndFinalize(NcclEPPrepareAndFinalize):
         valid_rows = (torch.arange(recv_x.shape[0], device=recv_x.device) < recv_total)[
             :, None
         ]
-        # PERF_REVIEW(pkousha): Masking and local quantization visit full capacity;
-        # investigate smaller per-graph bounds without dropping the padding mask.
+        # PERF_REVIEW(pkousha): In-place padding still visits full capacity;
+        # reduce tail work only while preserving defined padding across replay.
         # Byte views also support FP8, whose masked_fill is not implemented.
-        expert_x = (
-            recv_x.view(torch.uint8).masked_fill(~valid_rows, 0).view(recv_x.dtype)
-        )
+        expert_x = recv_x
+        expert_x.view(torch.uint8).masked_fill_(~valid_rows, 0)
         expert_x_scale = None
         if recv_scales is not None:
             assert quant_config.block_shape is not None

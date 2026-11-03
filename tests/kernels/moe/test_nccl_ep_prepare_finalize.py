@@ -180,7 +180,7 @@ def _check_dispatch(manager):
         x = torch.arange(n, device="cuda", dtype=torch.bfloat16)[:, None]
         x = (x + 1 + manager.rank * 8).expand(n, 1024).contiguous()
         weights = torch.tensor([0.25, 0.75], device="cuda").expand(n, 2).contiguous()
-        recv_x, scales, meta, recv_ids, recv_weights = prepare.prepare(
+        receiver = prepare.prepare_async(
             x,
             weights,
             ids,
@@ -189,6 +189,18 @@ def _check_dispatch(manager):
             False,
             FUSED_MOE_UNQUANTIZED_CONFIG,
         )
+        with (
+            torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU], profile_memory=True
+            )
+            if sizes == (1, 0)
+            else nullcontext()
+        ) as profile:
+            recv_x, scales, meta, recv_ids, recv_weights = receiver()
+        if profile is not None:
+            assert all(
+                event.device_memory_usage < recv_x.nbytes for event in profile.events()
+            ), "Padding must not allocate another full activation buffer"
         assert scales is None
         assert recv_ids is not None and recv_weights is not None and meta is not None
         offset = manager.rank * 2

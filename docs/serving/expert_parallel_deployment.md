@@ -44,7 +44,8 @@ NCCL-EP requires a positive expert count divisible by EP size. EP and DP sizes
 can differ, and EP subgroups can exclude global rank zero or use noncontiguous
 membership. Standard receive capacity is the configured maximum sender token
 count multiplied by EP size. Standard returns fixed-capacity tensors and masks
-unused rows on the GPU using the native receive count. Padding activations are
+unused activation rows in place on the GPU using the native receive count,
+without allocating another full activation buffer. Padding activations are
 zero and carry no valid expert assignments or nonzero routing weights.
 Native expert counters include all valid local top-k assignments. Received IDs
 are explicitly local at the NCCL boundary, then valid IDs are offset to vLLM's
@@ -64,7 +65,9 @@ activation buffers return to PyTorch through stream-aware allocator tracking;
 only eager routing stays attached to an idle handle. Captured temporaries belong
 to the PyTorch graph memory pool. Eager reuse on a different stream waits on the
 preceding invocation's completion event on the GPU; reuse on the same stream
-uses its existing ordering. Standard combine writes directly to a contiguous,
+uses its existing ordering. Standard also reuses DBO's compute-to-communication
+dependency when it covers the preceding producer stream. Other producer streams
+retain their explicit reuse dependency. Standard combine writes directly to a contiguous,
 16-byte-aligned caller output that does not share storage with the combine input.
 Other output views use a temporary followed by a copy.
 Without DBO, Standard asynchronous combine runs on the process's auxiliary stream
